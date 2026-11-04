@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 project(InstancingLab LANGUAGES C CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(FetchContent)
@@ -63,7 +63,9 @@ function(add_lab_executable name)
         src/gl_util.cpp
         src/grass.cpp
         src/profiler.cpp
-        src/render_target.cpp)
+        src/render_target.cpp
+        src/grass_renderer.cpp
+        src/stream_buffer.cpp)
     target_include_directories(${name} PRIVATE src)
     target_link_libraries(${name} PRIVATE glfw glm::glm libglew_static imgui OpenGL::GL)
     target_compile_definitions(${name} PRIVATE

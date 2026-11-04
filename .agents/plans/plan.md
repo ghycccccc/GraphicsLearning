@@ -127,8 +127,16 @@ RenderDoc (frame/buffer/indirect-args inspection), Nsight Graphics (frame debugg
    - frame-budget line (30/60/120/144 fps) with headroom and % of frames over budget
    - `InstancingLab_iGPU` build without the Optimus hint, to run on the Intel UHD as a low-end target
    - later stress hooks: shadow-map pass (M4), alpha-tested cards (M5)
-2. **Submission**: A0, A3, A5 (+ A1/A2/A4). First chart: draw-per-instance vs instancing across N.
-3. **Residency**: B1/B2/B3 with wind; bytes-uploaded and sim timing in the panel.
+2. **Submission** (done): A0 (+ redundant-state variant), A1, A2, A3 (attributes / SSBO), A5 (SubData /
+   orphaning / persistent ring). B1 "CPU per-blade wind" landed here because uploads need per-frame CPU data.
+   - Bend is now a world-space vector in the instance data, so CPU wind and VS wind share one layout.
+   - Frame pacing: max 2 frames in flight via a fence at frame start. Time waiting on it (+ swap) is the
+     GPU-bound signal; GPU timestamp spans include idle gaps inside a pass, so they can't decide this alone.
+   - GPU work = sum of top-level pass timestamps; CPU prep (animate/build/upload) runs before any pass.
+   - Benchmark CLI (`--path --animation --upload --bench-frames --csv`) + `tools/bench.py run|plot`; a minimal
+     version of M6, without the camera path.
+   - A4 (packed 16 B layout) moved to M3, where bandwidth is the topic.
+3. **Residency**: B2 compute + GPU-persistent data, B3 is the current VS wind; A4 packed layout.
 4. **Culling**: C1 → C2 (indirect) → C3 (LOD + MDI); frozen-camera and LOD debug views.
 5. **Pixel cost**: D1–D4, pipeline statistics, overdraw heatmap.
 6. **Benchmark mode**: camera path, sweeps, CSV, Python plots.

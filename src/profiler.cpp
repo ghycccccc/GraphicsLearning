@@ -63,12 +63,14 @@ void GpuProfiler::collect(Slot& slot) {
         return;
     }
     results_.clear();
+    passSumMs_ = 0.0;
     for (int i = 0; i < slot.count; ++i) {
         GLuint64 begin = 0, end = 0;
         glGetQueryObjectui64v(slot.queries[i * 2], GL_QUERY_RESULT, &begin);
         glGetQueryObjectui64v(slot.queries[i * 2 + 1], GL_QUERY_RESULT, &end);
         const double ms = double(end - begin) * 1e-6;
         results_.push_back({slot.names[i], ms, updateEma(ema_, slot.names[i], ms), slot.depth[i]});
+        if (slot.depth[i] == 1) passSumMs_ += ms;
     }
 }
 
@@ -85,10 +87,11 @@ void CpuProfiler::record(const char* name, double ms) {
 
 // --- FrameHistory ------------------------------------------------------------
 
-void FrameHistory::push(float frameMs, float cpuMs, float gpuMs) {
+void FrameHistory::push(float frameMs, float cpuMs, float gpuMs, float waitMs) {
     data_[Frame][head_] = frameMs;
     data_[Cpu][head_] = cpuMs;
     data_[Gpu][head_] = gpuMs;
+    data_[Wait][head_] = waitMs;
     head_ = (head_ + 1) % kCapacity;
     size_ = std::min(size_ + 1, kCapacity);
 }

@@ -16,10 +16,14 @@ std::string readTextFile(const std::string& path) {
     return ss.str();
 }
 
-static GLuint compileStage(const ShaderStage& stage) {
+static GLuint compileStage(const ShaderStage& stage, const std::string& defines) {
     const std::string path = std::string(SHADER_DIR) + stage.file;
-    const std::string source = readTextFile(path);
+    std::string source = readTextFile(path);
     if (source.empty()) return 0;
+    if (!defines.empty()) {
+        const size_t versionEnd = source.find('\n');
+        source.insert(versionEnd == std::string::npos ? source.size() : versionEnd + 1, defines);
+    }
 
     GLuint shader = glCreateShader(stage.type);
     const char* src = source.c_str();
@@ -40,12 +44,12 @@ static GLuint compileStage(const ShaderStage& stage) {
     return shader;
 }
 
-GLuint loadProgram(std::initializer_list<ShaderStage> stages) {
+GLuint loadProgram(std::initializer_list<ShaderStage> stages, const std::string& defines) {
     GLuint program = glCreateProgram();
     std::vector<GLuint> shaders;
     bool ok = true;
     for (const ShaderStage& stage : stages) {
-        GLuint shader = compileStage(stage);
+        GLuint shader = compileStage(stage, defines);
         if (!shader) {
             ok = false;
             break;

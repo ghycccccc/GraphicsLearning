@@ -3,6 +3,7 @@
 #include <glm/glm.hpp>
 
 #include <cstdint>
+#include <vector>
 
 // Shared per-frame inputs for scene shaders.
 struct SceneParams {
@@ -16,13 +17,18 @@ struct SceneParams {
     float fogDensity = 0.01f;
 };
 
-// Per-blade data as stored on the GPU (std430, 32 bytes).
+// Per-blade data as stored on the GPU (std430 / vertex attributes, 32 bytes).
 struct GrassInstance {
-    glm::vec4 posYaw; // xyz root position, w yaw (radians)
-    glm::vec4 params; // x height, y width, z forward bend, w color variation
+    glm::vec4 a; // root.x, root.z, yaw (radians), color variation
+    glm::vec4 b; // height, width, bend.x, bend.z (world-space tip offset as a fraction of height)
 };
+static_assert(sizeof(GrassInstance) == 32);
 
-// A square field of grass blades, all drawn as instances of one blade mesh.
+// Wind sway amount for a blade rooted at `rootXZ`. Must match windSway() in the shaders.
+float windSway(glm::vec2 rootXZ, float time, float strength);
+
+// A square field of grass blades: CPU copy of the per-blade data, a static GPU copy,
+// and the single blade mesh every path draws from.
 class GrassField {
 public:
     static constexpr int kMaxSegments = 16;
@@ -37,26 +43,36 @@ public:
     // Places `count` blades at `density` blades per m^2 and uploads them.
     // Returns false if the GPU could not allocate the instance buffer.
     bool regenerate(int count, float density, uint32_t seed);
-    void draw(const SceneParams& scene) const;
 
     int count() const { return count_; }
     float fieldSize() const { return fieldSize_; }
-    int trianglesPerBlade() const { return indexCount_ / 3; }
-    int verticesPerBlade() const { return vertexCount_; }
+    const std::vector<GrassInstance>& instances() const { return instances_; }
+
+    const std::vector<glm::vec2>& bladeVertices() const { return bladeVertices_; }
+    const std::vector<uint16_t>& bladeIndices() const { return bladeIndices_; }
+    int verticesPerBlade() const { return int(bladeVertices_.size()); }
+    int indicesPerBlade() const { return int(bladeIndices_.size()); }
+    int trianglesPerBlade() const { return indicesPerBlade() / 3; }
+
+    GLuint bladeVertexBuffer() const { return vbo_; }
+    GLuint bladeIndexBuffer() const { return ibo_; }
+    GLuint instanceBuffer() const { return instanceBuffer_; }
+
+    // Bumped whenever blades or the blade mesh change, so derived data can rebuild.
+    uint64_t version() const { return version_; }
 
 private:
-    GLuint program_ = 0;
-    GLuint vao_ = 0, vbo_ = 0, ibo_ = 0;
+    std::vector<GrassInstance> instances_;
+    std::vector<glm::vec2> bladeVertices_;
+    std::vector<uint16_t> bladeIndices_;
+    GLuint vbo_ = 0, ibo_ = 0;
     GLuint instanceBuffer_ = 0;
     uint64_t instanceBytes_ = 0;
     uint64_t meshBytes_ = 0;
+    uint64_t version_ = 0;
     int segments_ = 0;
-    int vertexCount_ = 0;
-    int indexCount_ = 0;
     int count_ = 0;
     float fieldSize_ = 0.0f;
-    GLint locViewProj_ = -1, locTime_ = -1, locWindDir_ = -1, locWindStrength_ = -1;
-    GLint locSunDir_ = -1, locCameraPos_ = -1, locFogColor_ = -1, locFogDensity_ = -1;
 };
 
 // Flat ground quad generated in the vertex shader.

@@ -30,7 +30,9 @@ public:
     void endFrame();
 
     const std::vector<Result>& results() const { return results_; }
-    double frameMs() const { return results_.empty() ? 0.0 : results_[0].ms; }
+    // Sum of the top-level passes. Unlike the frame-wide span, this excludes GPU idle gaps
+    // between passes (e.g. while the CPU builds the UI), though not gaps inside a pass.
+    double frameMs() const { return passSumMs_; }
     int missedReadbacks() const { return missed_; }
 
 private:
@@ -49,6 +51,7 @@ private:
     int depth_ = 0;
     int frameScope_ = -1;
     int missed_ = 0;
+    double passSumMs_ = 0.0;
     std::vector<Result> results_;
     std::unordered_map<std::string, double> ema_;
 };
@@ -93,14 +96,14 @@ struct CpuScope {
 class FrameHistory {
 public:
     static constexpr int kCapacity = 1024;
-    enum Series { Frame, Cpu, Gpu, kSeriesCount };
+    enum Series { Frame, Cpu, Gpu, Wait, kSeriesCount };
 
     struct Stats {
         float avg = 0, p50 = 0, p95 = 0, p99 = 0, max = 0;
         float worst1PctAvg = 0; // mean of the slowest 1% of frames ("1% low")
     };
 
-    void push(float frameMs, float cpuMs, float gpuMs);
+    void push(float frameMs, float cpuMs, float gpuMs, float waitMs);
     void clear() { head_ = size_ = 0; }
     Stats stats(Series series, int window) const;
     // Fraction of the last `window` samples above `thresholdMs`.
