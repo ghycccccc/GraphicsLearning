@@ -137,6 +137,8 @@ RenderDoc (frame/buffer/indirect-args inspection), Nsight Graphics (frame debugg
      version of M6, without the camera path.
    - A4 (packed 16 B layout) moved to M3, where bandwidth is the topic.
 3. **Residency**: B2 compute + GPU-persistent data, B3 is the current VS wind; A4 packed layout.
+   Detailed plan: [m3-residency.md](m3-residency.md) (stateful spring sim, CPU 1T/MT vs compute,
+   static/dynamic data split, 16 B layout, trample interactor, readback stall demo).
 4. **Culling**: C1 → C2 (indirect) → C3 (LOD + MDI); frozen-camera and LOD debug views.
 5. **Pixel cost**: D1–D4, pipeline statistics, overdraw heatmap.
 6. **Benchmark mode**: camera path, sweeps, CSV, Python plots.

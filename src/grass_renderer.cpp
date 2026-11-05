@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 
 namespace {
 // Vertex memory a batch may use. Static batches live on the GPU; dynamic ones are rewritten
@@ -22,28 +23,40 @@ void animateBlades(const GrassInstance* src, GrassInstance* dst, int count, cons
         const float sway = windSway({blade.a.x, blade.a.y}, scene.time, scene.windStrength);
         blade.b.z += scene.windDir.x * sway;
         blade.b.w += scene.windDir.y * sway;
-        dst[i] = blade; // whole-struct write: dst may be write-combined mapped memory
+        dst[i] = blade;
     }
 }
 } // namespace
 
+bool isInstanced(RenderPath path) {
+    return path == RenderPath::InstancedAttributes || path == RenderPath::InstancedSsbo;
+}
+
+bool isSpring(Animation animation) {
+    return animation == Animation::SpringCpu || animation == Animation::SpringCpuParallel ||
+           animation == Animation::SpringCompute;
+}
+
 Animation effectiveAnimation(const GrassRenderSettings& settings) {
     switch (settings.path) {
     case RenderPath::StaticBatch: return Animation::VertexShader;
-    case RenderPath::DynamicBatch: return Animation::CpuPerBlade;
+    case RenderPath::DynamicBatch: return Animation::CpuWind;
+    case RenderPath::PerBladeDraws:
+        return settings.animation == Animation::CpuWind ? Animation::CpuWind : Animation::VertexShader;
     default: return settings.animation;
     }
 }
 
 bool usesStreaming(const GrassRenderSettings& settings) {
     if (settings.path == RenderPath::DynamicBatch) return true;
-    return effectiveAnimation(settings) == Animation::CpuPerBlade &&
-           (settings.path == RenderPath::InstancedAttributes || settings.path == RenderPath::InstancedSsbo);
+    const Animation animation = effectiveAnimation(settings);
+    return isInstanced(settings.path) && (animation == Animation::CpuWind || animation == Animation::SpringCpu ||
+                                          animation == Animation::SpringCpuParallel);
 }
 
 // --- Program -----------------------------------------------------------------
 
-bool GrassRenderer::Program::load(const char* vertexShader, const char* defines) {
+bool GrassRenderer::Program::load(const char* vertexShader, const std::string& defines) {
     id = loadProgram({{GL_VERTEX_SHADER, vertexShader}, {GL_FRAGMENT_SHADER, "grass.frag"}}, defines);
     if (!id) return false;
     viewProj = glGetUniformLocation(id, "uViewProj");
@@ -73,13 +86,23 @@ void GrassRenderer::Program::setScene(const SceneParams& scene, bool procedural)
     g_counters.uniformUpdates += 9;
 }
 
+const GrassRenderer::Program& GrassRenderer::grassProgram(const std::string& defines) {
+    auto it = grassPrograms_.find(defines);
+    if (it == grassPrograms_.end()) {
+        Program program;
+        program.load("grass.vert", defines); // a failed compile leaves id 0: nothing draws
+        it = grassPrograms_.emplace(defines, program).first;
+    }
+    return it->second;
+}
+
 // --- GrassRenderer -----------------------------------------------------------
 
 bool GrassRenderer::init() {
-    if (!uniformProgram_.load("grass.vert", "#define INSTANCE_FROM_UNIFORMS\n") ||
-        !attributeProgram_.load("grass.vert", "#define INSTANCE_FROM_ATTRIBUTES\n") ||
-        !ssboProgram_.load("grass.vert", "#define INSTANCE_FROM_SSBO\n") ||
-        !batchedProgram_.load("grass_batched.vert", "")) {
+    // Compile the variants used at startup now, so shader errors surface immediately.
+    if (!grassProgram("#define INSTANCE_FROM_UNIFORMS\n").id ||
+        !grassProgram("#define INSTANCE_FROM_SSBO\n").id ||
+        !batchedProgram_.load("grass_batched.vert", "") || !sim_.init()) {
         return false;
     }
 
@@ -89,17 +112,20 @@ bool GrassRenderer::init() {
     glVertexArrayAttribFormat(bladeVao_, 0, 2, GL_FLOAT, GL_FALSE, 0);
     glVertexArrayAttribBinding(bladeVao_, 0, 0);
 
-    // Blade mesh on binding 0, per-blade data on binding 1 advancing once per instance.
+    // Blade mesh on binding 0, static blade data on binding 1 and bends on binding 2, both
+    // advancing once per instance. Attribute formats depend on the layout.
     glCreateVertexArrays(1, &attributeVao_);
     glEnableVertexArrayAttrib(attributeVao_, 0);
     glVertexArrayAttribFormat(attributeVao_, 0, 2, GL_FLOAT, GL_FALSE, 0);
     glVertexArrayAttribBinding(attributeVao_, 0, 0);
-    for (GLuint attrib : {1u, 2u}) {
+    for (GLuint attrib = 1; attrib <= 5; ++attrib) {
         glEnableVertexArrayAttrib(attributeVao_, attrib);
-        glVertexArrayAttribFormat(attributeVao_, attrib, 4, GL_FLOAT, GL_FALSE, (attrib - 1) * 16);
         glVertexArrayAttribBinding(attributeVao_, attrib, 1);
     }
+    glVertexArrayAttribBinding(attributeVao_, 6, 2);
     glVertexArrayBindingDivisor(attributeVao_, 1, 1);
+    glVertexArrayBindingDivisor(attributeVao_, 2, 1);
+    configureAttributeVao(InstanceLayout::Float32);
 
     // Pre-transformed batch vertices.
     glCreateVertexArrays(1, &batchVao_);
@@ -113,14 +139,37 @@ bool GrassRenderer::init() {
     return true;
 }
 
+void GrassRenderer::configureAttributeVao(InstanceLayout layout) {
+    if (layout == attributeVaoLayout_) return;
+    attributeVaoLayout_ = layout;
+    // The vertex fetch does the unpacking for free: the shader sees the same floats either way.
+    if (layout == InstanceLayout::Float32) {
+        glVertexArrayAttribFormat(attributeVao_, 1, 2, GL_FLOAT, GL_FALSE, 0);  // root
+        glVertexArrayAttribFormat(attributeVao_, 2, 1, GL_FLOAT, GL_FALSE, 8);  // yaw / 2pi
+        glVertexArrayAttribFormat(attributeVao_, 3, 1, GL_FLOAT, GL_FALSE, 12); // variation
+        glVertexArrayAttribFormat(attributeVao_, 4, 1, GL_FLOAT, GL_FALSE, 24); // rest bend / 0.5
+        glVertexArrayAttribFormat(attributeVao_, 5, 2, GL_FLOAT, GL_FALSE, 16); // height, width
+        glVertexArrayAttribFormat(attributeVao_, 6, 2, GL_FLOAT, GL_FALSE, 0);  // bend
+    } else {
+        glVertexArrayAttribFormat(attributeVao_, 1, 2, GL_FLOAT, GL_FALSE, 0);
+        glVertexArrayAttribFormat(attributeVao_, 2, 1, GL_UNSIGNED_SHORT, GL_TRUE, 8);
+        glVertexArrayAttribFormat(attributeVao_, 3, 1, GL_UNSIGNED_BYTE, GL_TRUE, 10);
+        glVertexArrayAttribFormat(attributeVao_, 4, 1, GL_UNSIGNED_BYTE, GL_TRUE, 11);
+        glVertexArrayAttribFormat(attributeVao_, 5, 2, GL_HALF_FLOAT, GL_FALSE, 12);
+        glVertexArrayAttribFormat(attributeVao_, 6, 2, GL_HALF_FLOAT, GL_FALSE, 0);
+    }
+}
+
 void GrassRenderer::destroy() {
-    for (Program* p : {&uniformProgram_, &attributeProgram_, &ssboProgram_, &batchedProgram_})
-        glDeleteProgram(p->id);
+    for (auto& [defines, program] : grassPrograms_) glDeleteProgram(program.id);
+    glDeleteProgram(batchedProgram_.id);
     glDeleteVertexArrays(1, &bladeVao_);
     glDeleteVertexArrays(1, &attributeVao_);
     glDeleteVertexArrays(1, &batchVao_);
-    instanceStream_.release();
+    staticStream_.release();
+    bendStream_.release();
     vertexStream_.release();
+    sim_.destroy();
     glDeleteBuffers(1, &batchIndexBuffer_);
     glDeleteBuffers(1, &staticBatchBuffer_);
 }
@@ -142,9 +191,12 @@ int GrassRenderer::bladeLimit(const GrassField& field, const GrassRenderSettings
 }
 
 void GrassRenderer::releaseUnused(const GrassRenderSettings& settings) {
-    const bool streaming = usesStreaming(settings);
-    if (!streaming || settings.path == RenderPath::DynamicBatch) instanceStream_.release();
+    const Animation animation = effectiveAnimation(settings);
+    const bool instancedStreaming = isInstanced(settings.path) && usesStreaming(settings);
+    if (!instancedStreaming) bendStream_.release();
+    if (!instancedStreaming || settings.uploadScope != UploadScope::Full) staticStream_.release();
     if (settings.path != RenderPath::DynamicBatch) vertexStream_.release();
+    if (!isInstanced(settings.path) || !isSpring(animation)) sim_.reset();
     if (settings.path != RenderPath::StaticBatch && staticBatchBuffer_) {
         glDeleteBuffers(1, &staticBatchBuffer_);
         staticBatchBuffer_ = 0;
@@ -160,7 +212,7 @@ void GrassRenderer::releaseUnused(const GrassRenderSettings& settings) {
         batchIndexBytes_ = 0;
         batchIndexVersion_ = ~0ull;
     }
-    if (settings.path != RenderPath::PerBladeDraws || effectiveAnimation(settings) != Animation::CpuPerBlade) {
+    if (settings.path != RenderPath::PerBladeDraws || animation != Animation::CpuWind) {
         animated_.clear();
         animated_.shrink_to_fit();
     }
@@ -228,18 +280,13 @@ void GrassRenderer::prepare(const GrassField& field, const SceneParams& scene,
                             const GrassRenderSettings& settings, CpuProfiler& cpu, GpuProfiler& gpu) {
     releaseUnused(settings);
     error_ = nullptr;
-    fenceWaitMs_ = 0.0;
-    frameBuffer_ = field.instanceBuffer();
-    frameOffset_ = 0;
     drawn_ = bladeLimit(field, settings);
-    frameBytes_ = uint64_t(drawn_) * sizeof(GrassInstance);
     if (drawn_ == 0) return;
 
-    const bool cpuAnimation = effectiveAnimation(settings) == Animation::CpuPerBlade;
     switch (settings.path) {
     case RenderPath::PerBladeDraws:
-        if (cpuAnimation) {
-            CpuScope scope(cpu, "CPU animate");
+        if (effectiveAnimation(settings) == Animation::CpuWind) {
+            CpuScope scope(cpu, "CPU wind");
             animated_.resize(size_t(drawn_));
             animateBlades(field.instances().data(), animated_.data(), drawn_, scene);
         }
@@ -253,15 +300,14 @@ void GrassRenderer::prepare(const GrassField& field, const SceneParams& scene,
     case RenderPath::DynamicBatch: {
         ensureBatchIndices(field, drawn_);
         const int verts = field.verticesPerBlade();
-        frameBytes_ = uint64_t(drawn_) * uint64_t(verts) * sizeof(BatchedVertex);
-        if (!vertexStream_.reserve(frameBytes_, settings.upload)) {
+        const uint64_t bytes = uint64_t(drawn_) * uint64_t(verts) * sizeof(BatchedVertex);
+        if (!vertexStream_.reserve(bytes, settings.upload)) {
             error_ = "Out of memory for the dynamic batch buffer";
             drawn_ = 0;
             return;
         }
         void* dst = vertexStream_.beginWrite();
-        fenceWaitMs_ = vertexStream_.lastWaitMs();
-        cpu.record("Fence wait", fenceWaitMs_);
+        cpu.record("Fence wait", vertexStream_.lastWaitMs());
         {
             CpuScope scope(cpu, "CPU build vertices");
             auto* out = static_cast<BatchedVertex*>(dst);
@@ -274,31 +320,14 @@ void GrassRenderer::prepare(const GrassField& field, const SceneParams& scene,
         }
         CpuScope scope(cpu, "Upload");
         GpuScope gpuScope(gpu, "Upload");
-        frameOffset_ = vertexStream_.endWrite(frameBytes_);
-        frameBuffer_ = vertexStream_.buffer();
+        frameVertexOffset_ = vertexStream_.endWrite(bytes);
+        frameVertexBuffer_ = vertexStream_.buffer();
         break;
     }
 
     case RenderPath::InstancedAttributes:
     case RenderPath::InstancedSsbo:
-        if (cpuAnimation) {
-            if (!instanceStream_.reserve(frameBytes_, settings.upload)) {
-                error_ = "Out of memory for the instance upload buffer";
-                drawn_ = 0;
-                return;
-            }
-            void* dst = instanceStream_.beginWrite();
-            fenceWaitMs_ = instanceStream_.lastWaitMs();
-            cpu.record("Fence wait", fenceWaitMs_);
-            {
-                CpuScope scope(cpu, "CPU animate");
-                animateBlades(field.instances().data(), static_cast<GrassInstance*>(dst), drawn_, scene);
-            }
-            CpuScope scope(cpu, "Upload");
-            GpuScope gpuScope(gpu, "Upload");
-            frameOffset_ = instanceStream_.endWrite(frameBytes_);
-            frameBuffer_ = instanceStream_.buffer();
-        }
+        prepareInstanced(field, scene, settings, cpu, gpu);
         break;
 
     default:
@@ -306,31 +335,93 @@ void GrassRenderer::prepare(const GrassField& field, const SceneParams& scene,
     }
 }
 
+void GrassRenderer::prepareInstanced(const GrassField& field, const SceneParams& scene,
+                                     const GrassRenderSettings& settings, CpuProfiler& cpu, GpuProfiler& gpu) {
+    const Animation animation = effectiveAnimation(settings);
+    const InstanceLayout layout = field.layout();
+    frameStaticBuffer_ = field.staticBuffer();
+    frameStaticOffset_ = 0;
+    frameBendBuffer_ = 0;
+    frameBendOffset_ = 0;
+    frameDynamicBend_ = animation != Animation::VertexShader;
+
+    SimParams sim;
+    sim.time = scene.time;
+    sim.stiffness = settings.stiffness;
+    sim.damping = settings.damping;
+    sim.windDir = scene.windDir;
+    sim.windStrength = scene.windStrength;
+    sim.trampleCenter = scene.trampleCenter;
+    sim.trampleRadius = scene.trampleRadius;
+
+    if (animation == Animation::SpringCompute) {
+        sim_.stepGpu(field, sim, settings.readback, cpu, gpu);
+        frameBendBuffer_ = sim_.bendBuffer();
+        return;
+    }
+    if (!usesStreaming(settings)) return;
+
+    // CPU-owned bends: write them straight into this frame's upload region.
+    const uint64_t bendBytes = uint64_t(drawn_) * bendStride(layout);
+    const bool full = settings.uploadScope == UploadScope::Full;
+    const uint64_t staticBytes = full ? uint64_t(drawn_) * staticStride(layout) : 0;
+    if (!bendStream_.reserve(bendBytes, settings.upload) ||
+        (full && !staticStream_.reserve(staticBytes, settings.upload))) {
+        error_ = "Out of memory for the upload buffers";
+        drawn_ = 0;
+        return;
+    }
+    void* bends = bendStream_.beginWrite();
+    cpu.record("Fence wait", bendStream_.lastWaitMs());
+    if (animation == Animation::CpuWind) {
+        CpuScope scope(cpu, "CPU wind");
+        for (int i = 0; i < drawn_; ++i) {
+            const GrassInstance& blade = field.instances()[size_t(i)];
+            const float sway = windSway({blade.a.x, blade.a.y}, scene.time, scene.windStrength);
+            storeBend(bends, size_t(i), glm::vec2(blade.b.z, blade.b.w) + scene.windDir * sway, layout);
+        }
+    } else {
+        sim_.stepCpu(field, sim, animation == Animation::SpringCpuParallel, bends, cpu);
+    }
+
+    CpuScope scope(cpu, "Upload");
+    GpuScope gpuScope(gpu, "Upload");
+    if (full) {
+        // An engine that re-sends whole instance records: copy the unchanged static data too.
+        std::memcpy(staticStream_.beginWrite(), field.staticBytes().data(), size_t(staticBytes));
+        frameStaticOffset_ = staticStream_.endWrite(staticBytes);
+        frameStaticBuffer_ = staticStream_.buffer();
+    }
+    frameBendOffset_ = bendStream_.endWrite(bendBytes);
+    frameBendBuffer_ = bendStream_.buffer();
+}
+
 void GrassRenderer::submit(const GrassField& field, const SceneParams& scene,
                            const GrassRenderSettings& settings, CpuProfiler& cpu) {
     if (drawn_ == 0) return;
     CpuScope scope(cpu, "Grass submit");
-    const bool cpuAnimation = effectiveAnimation(settings) == Animation::CpuPerBlade;
+    const Animation animation = effectiveAnimation(settings);
     const GLsizei bladeIndexCount = GLsizei(field.indicesPerBlade());
     glDisable(GL_CULL_FACE); // blades are two-sided
 
     switch (settings.path) {
     case RenderPath::PerBladeDraws: {
-        const Program& p = uniformProgram_;
+        const Program& p = grassProgram("#define INSTANCE_FROM_UNIFORMS\n");
+        const bool cpuWind = animation == Animation::CpuWind;
         glVertexArrayVertexBuffer(bladeVao_, 0, field.bladeVertexBuffer(), 0, sizeof(glm::vec2));
         glVertexArrayElementBuffer(bladeVao_, field.bladeIndexBuffer());
         glUseProgram(p.id);
         glBindVertexArray(bladeVao_);
-        p.setScene(scene, !cpuAnimation);
+        p.setScene(scene, !cpuWind);
         g_counters.stateChanges += 2;
 
-        const GrassInstance* blades = cpuAnimation ? animated_.data() : field.instances().data();
+        const GrassInstance* blades = cpuWind ? animated_.data() : field.instances().data();
         for (int i = 0; i < drawn_; ++i) {
             if (settings.redundantState) {
                 // What a naive engine does: every object binds and sets everything it needs.
                 glUseProgram(p.id);
                 glBindVertexArray(bladeVao_);
-                p.setScene(scene, !cpuAnimation);
+                p.setScene(scene, !cpuWind);
                 g_counters.stateChanges += 2;
             }
             glUniform4fv(p.instanceA, 1, &blades[i].a[0]);
@@ -344,9 +435,9 @@ void GrassRenderer::submit(const GrassField& field, const SceneParams& scene,
 
     case RenderPath::StaticBatch:
     case RenderPath::DynamicBatch: {
-        const GLuint vbo = settings.path == RenderPath::StaticBatch ? staticBatchBuffer_ : frameBuffer_;
-        const GLintptr offset = settings.path == RenderPath::StaticBatch ? 0 : frameOffset_;
-        glVertexArrayVertexBuffer(batchVao_, 0, vbo, offset, sizeof(BatchedVertex));
+        const bool isStatic = settings.path == RenderPath::StaticBatch;
+        glVertexArrayVertexBuffer(batchVao_, 0, isStatic ? staticBatchBuffer_ : frameVertexBuffer_,
+                                  isStatic ? 0 : frameVertexOffset_, sizeof(BatchedVertex));
         glVertexArrayElementBuffer(batchVao_, batchIndexBuffer_);
         glUseProgram(batchedProgram_.id);
         glBindVertexArray(batchVao_);
@@ -354,35 +445,54 @@ void GrassRenderer::submit(const GrassField& field, const SceneParams& scene,
         glDrawElements(GL_TRIANGLES, GLsizei(drawn_) * bladeIndexCount, GL_UNSIGNED_INT, nullptr);
         g_counters.stateChanges += 2;
         g_counters.drawCalls += 1;
-        if (settings.path == RenderPath::DynamicBatch) vertexStream_.endFrame();
+        if (!isStatic) vertexStream_.endFrame();
         break;
     }
 
     case RenderPath::InstancedAttributes:
-        glVertexArrayVertexBuffer(attributeVao_, 0, field.bladeVertexBuffer(), 0, sizeof(glm::vec2));
-        glVertexArrayVertexBuffer(attributeVao_, 1, frameBuffer_, frameOffset_, sizeof(GrassInstance));
-        glVertexArrayElementBuffer(attributeVao_, field.bladeIndexBuffer());
-        glUseProgram(attributeProgram_.id);
-        glBindVertexArray(attributeVao_);
-        attributeProgram_.setScene(scene, !cpuAnimation);
-        glDrawElementsInstanced(GL_TRIANGLES, bladeIndexCount, GL_UNSIGNED_SHORT, nullptr, drawn_);
-        g_counters.stateChanges += 2;
-        g_counters.drawCalls += 1;
-        if (cpuAnimation) instanceStream_.endFrame();
-        break;
+    case RenderPath::InstancedSsbo: {
+        const InstanceLayout layout = field.layout();
+        const bool ssbo = settings.path == RenderPath::InstancedSsbo;
+        std::string defines = ssbo ? "#define INSTANCE_FROM_SSBO\n" : "#define INSTANCE_FROM_ATTRIBUTES\n";
+        if (ssbo && layout == InstanceLayout::Packed16) defines += "#define PACKED_LAYOUT\n";
+        if (frameDynamicBend_) defines += "#define DYNAMIC_BEND\n";
+        const Program& p = grassProgram(defines);
 
-    case RenderPath::InstancedSsbo:
-        glVertexArrayVertexBuffer(bladeVao_, 0, field.bladeVertexBuffer(), 0, sizeof(glm::vec2));
-        glVertexArrayElementBuffer(bladeVao_, field.bladeIndexBuffer());
-        glUseProgram(ssboProgram_.id);
-        glBindVertexArray(bladeVao_);
-        glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 0, frameBuffer_, frameOffset_, GLsizeiptr(frameBytes_));
-        ssboProgram_.setScene(scene, !cpuAnimation);
+        if (ssbo) {
+            glVertexArrayVertexBuffer(bladeVao_, 0, field.bladeVertexBuffer(), 0, sizeof(glm::vec2));
+            glVertexArrayElementBuffer(bladeVao_, field.bladeIndexBuffer());
+            glBindVertexArray(bladeVao_);
+            glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 0, frameStaticBuffer_, frameStaticOffset_,
+                              GLsizeiptr(uint64_t(drawn_) * staticStride(layout)));
+            if (frameDynamicBend_) {
+                glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 1, frameBendBuffer_, frameBendOffset_,
+                                  GLsizeiptr(uint64_t(drawn_) * bendStride(layout)));
+            }
+        } else {
+            configureAttributeVao(layout);
+            glVertexArrayVertexBuffer(attributeVao_, 0, field.bladeVertexBuffer(), 0, sizeof(glm::vec2));
+            glVertexArrayVertexBuffer(attributeVao_, 1, frameStaticBuffer_, frameStaticOffset_, staticStride(layout));
+            // An enabled array needs a buffer, so the bend attribute is only on when used.
+            if (frameDynamicBend_) {
+                glEnableVertexArrayAttrib(attributeVao_, 6);
+                glVertexArrayVertexBuffer(attributeVao_, 2, frameBendBuffer_, frameBendOffset_, bendStride(layout));
+            } else {
+                glDisableVertexArrayAttrib(attributeVao_, 6);
+            }
+            glVertexArrayElementBuffer(attributeVao_, field.bladeIndexBuffer());
+            glBindVertexArray(attributeVao_);
+        }
+        glUseProgram(p.id);
+        p.setScene(scene, animation == Animation::VertexShader);
         glDrawElementsInstanced(GL_TRIANGLES, bladeIndexCount, GL_UNSIGNED_SHORT, nullptr, drawn_);
-        g_counters.stateChanges += 3;
+        g_counters.stateChanges += frameDynamicBend_ ? 4 : 3;
         g_counters.drawCalls += 1;
-        if (cpuAnimation) instanceStream_.endFrame();
+        if (usesStreaming(settings)) {
+            bendStream_.endFrame();
+            if (settings.uploadScope == UploadScope::Full) staticStream_.endFrame();
+        }
         break;
+    }
 
     default:
         break;

@@ -3,9 +3,41 @@
 #include "counters.h"
 #include "gl_util.h"
 
+#include <glm/gtc/packing.hpp>
+
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
+
+void storeBend(void* bends, size_t index, glm::vec2 bend, InstanceLayout layout) {
+    if (layout == InstanceLayout::Float32) static_cast<glm::vec2*>(bends)[index] = bend;
+    else static_cast<uint32_t*>(bends)[index] = glm::packHalf2x16(bend);
+}
+
+namespace {
+void encodeStatic(const GrassInstance& blade, InstanceLayout layout, std::byte* out) {
+    const float yaw01 = blade.a.z / 6.2831853f;
+    const float restBend01 = glm::length(glm::vec2(blade.b.z, blade.b.w)) / 0.5f;
+    if (layout == InstanceLayout::Float32) {
+        const glm::vec4 words[2] = {{blade.a.x, blade.a.y, yaw01, blade.a.w},
+                                    {blade.b.x, blade.b.y, restBend01, 0.0f}};
+        std::memcpy(out, words, sizeof(words));
+        return;
+    }
+    auto unorm = [](float v, float maxValue) {
+        return uint32_t(std::lround(std::clamp(v, 0.0f, 1.0f) * maxValue));
+    };
+    const uint32_t words[4] = {
+        glm::floatBitsToUint(blade.a.x),
+        glm::floatBitsToUint(blade.a.y),
+        unorm(yaw01, 65535.0f) | unorm(blade.a.w, 255.0f) << 16 | unorm(restBend01, 255.0f) << 24,
+        glm::packHalf2x16({blade.b.x, blade.b.y}),
+    };
+    std::memcpy(out, words, sizeof(words));
+}
+} // namespace
 
 float windSway(glm::vec2 rootXZ, float time, float strength) {
     const float phase = time * 1.7f + rootXZ.x * 0.13f + rootXZ.y * 0.09f;
@@ -22,7 +54,7 @@ bool GrassField::init() {
 void GrassField::destroy() {
     glDeleteBuffers(1, &vbo_);
     glDeleteBuffers(1, &ibo_);
-    glDeleteBuffers(1, &instanceBuffer_);
+    glDeleteBuffers(1, &staticBuffer_);
 }
 
 void GrassField::setSegments(int segments) {
@@ -80,30 +112,48 @@ bool GrassField::regenerate(int count, float density, uint32_t seed) {
         blade.b = {height, width, std::sin(yaw) * bend, std::cos(yaw) * bend};
     }
 
-    if (instanceBuffer_) {
-        glDeleteBuffers(1, &instanceBuffer_);
-        g_residentBytes -= instanceBytes_;
-        instanceBuffer_ = 0;
-        instanceBytes_ = 0;
-        count_ = 0;
-    }
-    while (glGetError() != GL_NO_ERROR) {
-    }
-    const uint64_t bytes = uint64_t(count) * sizeof(GrassInstance);
-    glCreateBuffers(1, &instanceBuffer_);
-    glNamedBufferStorage(instanceBuffer_, GLsizeiptr(bytes), instances_.data(), 0);
-    if (glGetError() == GL_OUT_OF_MEMORY) {
-        std::fprintf(stderr, "Out of GPU memory allocating %.0f MB of instances\n",
-                     double(bytes) / (1024.0 * 1024.0));
-        glDeleteBuffers(1, &instanceBuffer_);
-        instanceBuffer_ = 0;
+    count_ = count;
+    if (!rebuildStatic()) {
         instances_.clear();
+        count_ = 0;
         return false;
     }
-    instanceBytes_ = bytes;
-    g_residentBytes += instanceBytes_;
-    g_counters.bytesUploaded += instanceBytes_;
-    count_ = count;
+    return true;
+}
+
+bool GrassField::setLayout(InstanceLayout layout) {
+    if (layout == layout_) return true;
+    layout_ = layout;
+    ++version_;
+    return rebuildStatic();
+}
+
+bool GrassField::rebuildStatic() {
+    if (staticBuffer_) {
+        glDeleteBuffers(1, &staticBuffer_);
+        g_residentBytes -= staticBufferBytes_;
+        staticBuffer_ = 0;
+        staticBufferBytes_ = 0;
+    }
+    const uint32_t stride = staticStride(layout_);
+    staticBytes_.resize(instances_.size() * stride);
+    for (size_t i = 0; i < instances_.size(); ++i) encodeStatic(instances_[i], layout_, &staticBytes_[i * stride]);
+    if (staticBytes_.empty()) return true;
+
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    glCreateBuffers(1, &staticBuffer_);
+    glNamedBufferStorage(staticBuffer_, GLsizeiptr(staticBytes_.size()), staticBytes_.data(), 0);
+    if (glGetError() == GL_OUT_OF_MEMORY) {
+        std::fprintf(stderr, "Out of GPU memory allocating %.0f MB of blade data\n",
+                     double(staticBytes_.size()) / (1024.0 * 1024.0));
+        glDeleteBuffers(1, &staticBuffer_);
+        staticBuffer_ = 0;
+        return false;
+    }
+    staticBufferBytes_ = staticBytes_.size();
+    g_residentBytes += staticBufferBytes_;
+    g_counters.bytesUploaded += staticBufferBytes_;
     return true;
 }
 

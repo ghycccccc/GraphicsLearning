@@ -3,3 +3,4 @@ out/
 .vs/
 *.csv
 imgui.ini
+.agents

@@ -1,58 +1,121 @@
 #version 460 core
-// Variants (one must be defined by the host):
-//   INSTANCE_FROM_SSBO        instanced draw, per-blade data indexed by gl_InstanceID
-//   INSTANCE_FROM_ATTRIBUTES  instanced draw, per-blade data as divisor-1 vertex attributes
-//   INSTANCE_FROM_UNIFORMS    one draw per blade, data set as uniforms before each draw
+// Variants (exactly one source must be defined by the host):
+//   INSTANCE_FROM_UNIFORMS    one draw per blade, CPU record set as uniforms before each draw
+//   INSTANCE_FROM_ATTRIBUTES  instanced draw, divisor-1 vertex attributes (the VAO formats
+//                             decode either InstanceLayout, so no PACKED_LAYOUT variant)
+//   INSTANCE_FROM_SSBO        instanced draw, blade data fetched by gl_InstanceID
+// Modifiers:
+//   PACKED_LAYOUT  SSBO data is the 16 B packed encoding (see InstanceLayout in grass.h)
+//   DYNAMIC_BEND   current bend comes from a per-frame buffer (CPU upload or compute sim)
+//                  instead of the static rest bend
 
 layout(location = 0) in vec2 aBlade; // x across the blade in [-0.5, 0.5], y = t in [0, 1]
 
-// Per-blade data (32 bytes):
-//   a = (root.x, root.z, yaw, color variation)
-//   b = (height, width, bend.x, bend.z)  bend = world-space tip offset as a fraction of height
-#if defined(INSTANCE_FROM_SSBO)
-struct Instance { vec4 a; vec4 b; };
-layout(std430, binding = 0) readonly buffer Instances { Instance instances[]; };
+#if defined(INSTANCE_FROM_UNIFORMS)
+uniform vec4 uInstanceA; // root.x, root.z, yaw (radians), color variation
+uniform vec4 uInstanceB; // height, width, bend.x, bend.z
 #elif defined(INSTANCE_FROM_ATTRIBUTES)
-layout(location = 1) in vec4 aInstanceA;
-layout(location = 2) in vec4 aInstanceB;
+layout(location = 1) in vec2 aRoot;
+layout(location = 2) in float aYaw01;
+layout(location = 3) in float aVariation;
+layout(location = 4) in float aRestBend01;
+layout(location = 5) in vec2 aSize;
+#  ifdef DYNAMIC_BEND
+layout(location = 6) in vec2 aBend;
+#  endif
 #else
-uniform vec4 uInstanceA;
-uniform vec4 uInstanceB;
+#  ifdef PACKED_LAYOUT
+layout(std430, binding = 0) readonly buffer Statics { uvec4 statics[]; };
+layout(std430, binding = 1) readonly buffer Bends { uint bends[]; };
+#  else
+struct StaticBlade { vec4 a; vec4 b; };
+layout(std430, binding = 0) readonly buffer Statics { StaticBlade statics[]; };
+layout(std430, binding = 1) readonly buffer Bends { vec2 bends[]; };
+#  endif
 #endif
 
 uniform mat4 uViewProj;
 uniform float uTime;
 uniform vec2 uWindDir;
 uniform float uWindStrength;
-uniform bool uProceduralWind; // false when the CPU already folded wind into bend
+uniform bool uProceduralWind; // false when the bend already includes wind
 
 out vec3 vWorldPos;
 out vec3 vNormal;
 out float vT;
 out float vVariation;
 
-// Must match windSway() in grass.cpp.
+struct Blade {
+    vec2 root;
+    float yaw;
+    float variation;
+    float height;
+    float width;
+    vec2 bend; // world-space tip offset as a fraction of height
+};
+
+// Must match windSway() in grass.cpp and grass_sim.comp.
 float windSway(vec2 rootXZ) {
     float phase = uTime * 1.7 + dot(rootXZ, vec2(0.13, 0.09));
     return (0.5 + 0.35 * sin(phase) + 0.15 * sin(phase * 2.3 + 1.0)) * uWindStrength;
 }
 
-void main() {
-#if defined(INSTANCE_FROM_SSBO)
-    vec4 ia = instances[gl_InstanceID].a;
-    vec4 ib = instances[gl_InstanceID].b;
-#elif defined(INSTANCE_FROM_ATTRIBUTES)
-    vec4 ia = aInstanceA;
-    vec4 ib = aInstanceB;
+Blade fetchBlade() {
+    Blade b;
+#if defined(INSTANCE_FROM_UNIFORMS)
+    b.root = uInstanceA.xy;
+    b.yaw = uInstanceA.z;
+    b.variation = uInstanceA.w;
+    b.height = uInstanceB.x;
+    b.width = uInstanceB.y;
+    b.bend = uInstanceB.zw;
 #else
-    vec4 ia = uInstanceA;
-    vec4 ib = uInstanceB;
+    float yaw01, restBend01;
+    vec2 size;
+#  if defined(INSTANCE_FROM_ATTRIBUTES)
+    b.root = aRoot;
+    yaw01 = aYaw01;
+    b.variation = aVariation;
+    restBend01 = aRestBend01;
+    size = aSize;
+#  elif defined(PACKED_LAYOUT)
+    uvec4 s = statics[gl_InstanceID];
+    b.root = uintBitsToFloat(s.xy);
+    yaw01 = float(s.z & 0xFFFFu) / 65535.0;
+    b.variation = float((s.z >> 16) & 0xFFu) / 255.0;
+    restBend01 = float(s.z >> 24) / 255.0;
+    size = unpackHalf2x16(s.w);
+#  else
+    StaticBlade s = statics[gl_InstanceID];
+    b.root = s.a.xy;
+    yaw01 = s.a.z;
+    b.variation = s.a.w;
+    size = s.b.xy;
+    restBend01 = s.b.z;
+#  endif
+    b.yaw = yaw01 * 6.2831853;
+    b.height = size.x;
+    b.width = size.y;
+#  if !defined(DYNAMIC_BEND)
+    b.bend = vec2(sin(b.yaw), cos(b.yaw)) * (0.5 * restBend01);
+#  elif defined(INSTANCE_FROM_ATTRIBUTES)
+    b.bend = aBend;
+#  elif defined(PACKED_LAYOUT)
+    b.bend = unpackHalf2x16(bends[gl_InstanceID]);
+#  else
+    b.bend = bends[gl_InstanceID];
+#  endif
 #endif
-    vec3 root = vec3(ia.x, 0.0, ia.y);
-    vec3 right = vec3(cos(ia.z), 0.0, -sin(ia.z));
-    float h = ib.x, w = ib.y;
-    vec2 bend = ib.zw;
-    if (uProceduralWind) bend += uWindDir * windSway(root.xz);
+    return b;
+}
+
+void main() {
+    Blade blade = fetchBlade();
+    vec3 root = vec3(blade.root.x, 0.0, blade.root.y);
+    vec3 right = vec3(cos(blade.yaw), 0.0, -sin(blade.yaw));
+    float h = blade.height, w = blade.width;
+    vec2 bend = blade.bend;
+    if (uProceduralWind) bend += uWindDir * windSway(blade.root);
     vec3 bend3 = vec3(bend.x, 0.0, bend.y);
     float t = aBlade.y;
 
@@ -62,6 +125,6 @@ void main() {
     vNormal = normalize(cross(right, dPdt));
     vWorldPos = p;
     vT = t;
-    vVariation = ia.w;
+    vVariation = blade.variation;
     gl_Position = uViewProj * vec4(p, 1.0);
 }

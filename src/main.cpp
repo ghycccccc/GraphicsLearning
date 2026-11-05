@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 
 // Ask Optimus / PowerXpress laptops to run this process on the discrete GPU.
 // The InstancingLab_iGPU target omits this to benchmark the integrated GPU.
@@ -66,6 +67,9 @@ struct AppState {
     int statsWindow = 240;
     bool resetStats = false;
     int warmupFrames = 0; // frames left to skip after a reset
+    float gameLogicMs = 0.0f; // simulated per-frame CPU work (gameplay, AI, physics...)
+    bool hasCameraStart = false;
+    float cameraStart[5] = {}; // x, y, z, yaw, pitch
 
     // Benchmark mode: measure, append one CSV row, exit.
     int benchFrames = 0;
@@ -109,7 +113,23 @@ void parseArgs(int argc, char** argv, AppState& app) {
         else if (key == "--path") parseEnum(value, kRenderPathKeys, app.render.path);
         else if (key == "--animation") parseEnum(value, kAnimationKeys, app.render.animation);
         else if (key == "--upload") parseEnum(value, kUploadKeys, app.render.upload);
+        else if (key == "--upload-scope") parseEnum(value, kUploadScopeKeys, app.render.uploadScope);
+        else if (key == "--layout") parseEnum(value, kLayoutKeys, app.render.layout);
+        else if (key == "--trample") parseEnum(value, kTrampleKeys, app.render.trample);
+        else if (key == "--readback") parseEnum(value, kReadbackKeys, app.render.readback);
+        else if (key == "--stiffness") app.render.stiffness = float(std::atof(value));
+        else if (key == "--damping") app.render.damping = float(std::atof(value));
         else if (key == "--redundant") app.render.redundantState = std::atoi(value) != 0;
+        else if (key == "--game-logic-ms") app.gameLogicMs = std::clamp(float(std::atof(value)), 0.0f, 100.0f);
+        else if (key == "--camera") {
+            // x,y,z,yaw,pitch (radians)
+            if (std::sscanf(value, "%f,%f,%f,%f,%f", &app.cameraStart[0], &app.cameraStart[1], &app.cameraStart[2],
+                            &app.cameraStart[3], &app.cameraStart[4]) != 5) {
+                std::fprintf(stderr, "--camera expects x,y,z,yaw,pitch\n");
+            } else {
+                app.hasCameraStart = true;
+            }
+        }
         else if (key == "--cap") app.render.cpuPathCap = std::clamp(std::atoi(value), 1, kMaxInstances);
         else if (key == "--bench-frames") app.benchFrames = std::clamp(std::atoi(value), 5, FrameHistory::kCapacity);
         else if (key == "--bench-seconds") app.benchSeconds = float(std::atof(value));
@@ -144,32 +164,61 @@ void statsRow(const char* label, const FrameHistory::Stats& s) {
     }
 }
 
+template <typename Results>
+double averageMs(const Results& results, const char* name) {
+    for (const auto& r : results) {
+        if (std::strcmp(r.name, name) == 0) return r.avgMs;
+    }
+    return 0.0;
+}
+
 void appendCsvRow(const AppState& app, const GrassField& grass, const GrassRenderer& renderer,
-                  const FrameHistory& history, const FrameReport& report, const char* gpuName) {
+                  const FrameHistory& history, const FrameReport& report, const CpuProfiler& cpuProfiler,
+                  const GpuProfiler& gpuProfiler, const char* gpuName) {
     const int window = history.size();
     const auto frame = history.stats(FrameHistory::Frame, window);
     const auto cpu = history.stats(FrameHistory::Cpu, window);
     const auto gpu = history.stats(FrameHistory::Gpu, window);
     const auto wait = history.stats(FrameHistory::Wait, window);
 
+    static const char* kHeader =
+        "gpu,path,animation,upload,upload_scope,layout,trample,readback,redundant,instances,drawn,segments,"
+        "scale,frames,frame_avg,frame_p50,frame_p95,frame_p99,cpu_avg,gpu_avg,wait_avg,sim_cpu_ms,sim_gpu_ms,"
+        "readback_ms,draw_calls,triangles,upload_mb,verdict,game_logic_ms";
     const std::filesystem::path path(app.csvPath);
     if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
-    const bool writeHeader = !std::filesystem::exists(path);
-    std::ofstream out(path, std::ios::app);
-    if (writeHeader) {
-        out << "gpu,path,animation,upload,redundant,instances,drawn,segments,scale,frames,"
-               "frame_avg,frame_p50,frame_p95,frame_p99,cpu_avg,gpu_avg,wait_avg,"
-               "draw_calls,triangles,upload_mb,verdict\n";
+    const bool exists = std::filesystem::exists(path);
+    if (exists) {
+        std::ifstream in(path);
+        std::string header;
+        std::getline(in, header);
+        if (header != kHeader) {
+            std::fprintf(stderr, "%s has a different column layout; use a new --csv file\n", app.csvPath.c_str());
+            return;
+        }
     }
+    std::ofstream out(path, std::ios::app);
+    if (!exists) out << kHeader << '\n';
+
     const GrassRenderSettings& r = app.render;
-    out << '"' << gpuName << "\"," << kRenderPathKeys[int(r.path)] << ','
-        << kAnimationKeys[int(effectiveAnimation(r))] << ','
-        << (usesStreaming(r) ? kUploadKeys[int(r.upload)] : "none") << ',' << int(r.redundantState) << ','
-        << grass.count() << ',' << renderer.drawnBlades() << ',' << grass.segments() << ',' << app.renderScale << ','
-        << window << ',' << frame.avg << ',' << frame.p50 << ',' << frame.p95 << ',' << frame.p99 << ','
-        << cpu.avg << ',' << gpu.avg << ',' << wait.avg << ',' << report.counters.drawCalls << ','
-        << report.counters.triangles << ',' << double(report.counters.bytesUploaded) / (1024.0 * 1024.0) << ','
-        << verdictFor(false, frame.avg, cpu.avg, wait.avg) << '\n';
+    const Animation animation = effectiveAnimation(r);
+    const bool instanced = isInstanced(r.path);
+    const double simCpuMs = averageMs(cpuProfiler.results(), "Simulate (CPU)") +
+                            averageMs(cpuProfiler.results(), "CPU wind") +
+                            averageMs(cpuProfiler.results(), "CPU build vertices");
+    out << '"' << gpuName << "\"," << kRenderPathKeys[int(r.path)] << ',' << kAnimationKeys[int(animation)] << ','
+        << (usesStreaming(r) ? kUploadKeys[int(r.upload)] : "none") << ','
+        << (usesStreaming(r) && instanced ? kUploadScopeKeys[int(r.uploadScope)] : "none") << ','
+        << (instanced ? kLayoutKeys[int(r.layout)] : "none") << ','
+        << (instanced && isSpring(animation) ? kTrampleKeys[int(r.trample)] : "none") << ','
+        << (instanced && animation == Animation::SpringCompute ? kReadbackKeys[int(r.readback)] : "none") << ','
+        << int(r.redundantState) << ',' << grass.count() << ',' << renderer.drawnBlades() << ','
+        << grass.segments() << ',' << app.renderScale << ',' << window << ',' << frame.avg << ',' << frame.p50 << ','
+        << frame.p95 << ',' << frame.p99 << ',' << cpu.avg << ',' << gpu.avg << ',' << wait.avg << ',' << simCpuMs
+        << ',' << averageMs(gpuProfiler.results(), "Simulate") << ',' << renderer.sim().readbackStallMs() << ','
+        << report.counters.drawCalls << ',' << report.counters.triangles << ','
+        << double(report.counters.bytesUploaded) / (1024.0 * 1024.0) << ','
+        << verdictFor(false, frame.avg, cpu.avg, wait.avg) << ',' << app.gameLogicMs << '\n';
     std::printf("bench: %s %d blades: frame %.2f ms (cpu %.2f, gpu %.2f, wait %.2f)\n",
                 kRenderPathKeys[int(r.path)], grass.count(), frame.avg, cpu.avg, gpu.avg, wait.avg);
 }
@@ -197,17 +246,55 @@ void drawUi(AppState& app, FlyCamera& camera, const GrassField& grass, const Gra
         if (ImGui::Combo("Path", &path, kRenderPathNames, IM_ARRAYSIZE(kRenderPathNames))) r.path = RenderPath(path);
 
         const bool batch = r.path == RenderPath::StaticBatch || r.path == RenderPath::DynamicBatch;
+        const bool instanced = isInstanced(r.path);
         if (batch) {
             ImGui::TextDisabled("Animation: %s (fixed for this path)", kAnimationNames[int(effectiveAnimation(r))]);
         } else {
-            int animation = int(r.animation);
-            if (ImGui::Combo("Animation", &animation, kAnimationNames, IM_ARRAYSIZE(kAnimationNames)))
-                r.animation = Animation(animation);
+            // Per-blade draws only offer the stateless modes; the spring sim is instanced-only.
+            int animation = int(effectiveAnimation(r));
+            const int choices = instanced ? IM_ARRAYSIZE(kAnimationNames) : 2;
+            if (ImGui::Combo("Animation", &animation, kAnimationNames, choices)) r.animation = Animation(animation);
+        }
+        const Animation animation = effectiveAnimation(r);
+        if (instanced) {
+            int layout = int(r.layout);
+            if (ImGui::Combo("Instance layout", &layout, kLayoutNames, IM_ARRAYSIZE(kLayoutNames)))
+                r.layout = InstanceLayout(layout);
         }
         if (usesStreaming(r)) {
             int upload = int(r.upload);
             if (ImGui::Combo("Upload", &upload, kUploadNames, IM_ARRAYSIZE(kUploadNames)))
                 r.upload = UploadMethod(upload);
+            if (instanced) {
+                int scope = int(r.uploadScope);
+                if (ImGui::Combo("Upload scope", &scope, kUploadScopeNames, IM_ARRAYSIZE(kUploadScopeNames)))
+                    r.uploadScope = UploadScope(scope);
+            }
+        }
+        if (instanced && isSpring(animation)) {
+            ImGui::SliderFloat("Stiffness", &r.stiffness, 5.0f, 200.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("Damping", &r.damping, 0.0f, 30.0f, "%.1f");
+            int trample = int(r.trample);
+            if (ImGui::Combo("Trample", &trample, kTrampleNames, IM_ARRAYSIZE(kTrampleNames)))
+                r.trample = Trample(trample);
+            if (animation == Animation::SpringCompute) {
+                int readback = int(r.readback);
+                if (ImGui::Combo("CPU readback", &readback, kReadbackNames, IM_ARRAYSIZE(kReadbackNames)))
+                    r.readback = Readback(readback);
+            }
+            const GrassSim& sim = grassRenderer.sim();
+            if (sim.flattenedAgeFrames() >= 0) {
+                ImGui::Text("Flattened blades: %s (%d frame%s old)", withSeparators(uint64_t(sim.flattenedBlades())).c_str(),
+                            sim.flattenedAgeFrames(), sim.flattenedAgeFrames() == 1 ? "" : "s");
+            } else {
+                ImGui::TextDisabled("Flattened blades: unknown to the CPU (no readback)");
+            }
+            if (animation == Animation::SpringCompute && r.readback == Readback::Sync) {
+                ImGui::Text("Readback stall: %.2f ms", sim.readbackStallMs());
+            }
+            if (animation == Animation::SpringCpuParallel) {
+                ImGui::TextDisabled("%u hardware threads", std::thread::hardware_concurrency());
+            }
         }
         if (r.path == RenderPath::PerBladeDraws) {
             ImGui::Checkbox("Redundant state per draw", &r.redundantState);
@@ -285,6 +372,11 @@ void drawUi(AppState& app, FlyCamera& camera, const GrassField& grass, const Gra
             ImGui::TextColored(color, "Headroom %.2f ms (%.0f%% of budget)   over budget: %.1f%% of frames",
                                headroom, 100.0f * headroom / budgetMs, 100.0f * missed);
         }
+
+        ImGui::SliderFloat("Game logic (CPU)", &app.gameLogicMs, 0.0f, 30.0f, "%.1f ms");
+        if (ImGui::IsItemDeactivatedAfterEdit()) app.resetStats = true;
+        ImGui::TextDisabled("Busy-waits on the main thread after the grass sim/readback,\n"
+                            "standing in for gameplay, AI and physics.");
 
         ImGui::Text("Verdict: %s", verdictFor(app.vsync, frame.avg, cpuStats.avg, waitStats.avg));
         ImGui::SameLine();
@@ -423,6 +515,11 @@ int main(int argc, char** argv) {
     CpuProfiler cpu;
     FrameHistory history;
     FlyCamera camera;
+    if (app.hasCameraStart) {
+        camera.position = {app.cameraStart[0], app.cameraStart[1], app.cameraStart[2]};
+        camera.yaw = app.cameraStart[3];
+        camera.pitch = app.cameraStart[4];
+    }
     FrameReport report;
     RenderTarget sceneTarget;
     GLsync frameFences[kMaxFramesInFlight] = {};
@@ -465,7 +562,7 @@ int main(int argc, char** argv) {
         if (app.benchFrames > 0 && app.warmupFrames == 0 && history.size() >= 5 &&
             (history.size() >= app.benchFrames ||
              msBetween(statsResetTime, frameStart) > app.benchSeconds * 1000.0)) {
-            appendCsvRow(app, grass, grassRenderer, history, report, gpuName);
+            appendCsvRow(app, grass, grassRenderer, history, report, cpu, gpu, gpuName);
             break;
         }
 
@@ -515,6 +612,11 @@ int main(int argc, char** argv) {
             grass.setSegments(app.segments);
             app.resetStats = true;
         }
+        if (app.render.layout != grass.layout()) {
+            CpuScope scope(cpu, "Re-encode blades");
+            app.regenerateFailed = !grass.setLayout(app.render.layout);
+            app.resetStats = true;
+        }
         if (!(app.render == lastRenderSettings)) {
             lastRenderSettings = app.render;
             app.resetStats = true;
@@ -545,9 +647,29 @@ int main(int argc, char** argv) {
         scene.sunDir = glm::normalize(glm::vec3(0.4f, 0.8f, 0.3f));
         scene.fogColor = defaults.fogColor;
         scene.fogDensity = app.fogDensity;
+        if (app.render.trample == Trample::Circle) {
+            const float radius = std::fmin(grass.fieldSize() * 0.3f, 12.0f);
+            scene.trampleCenter = {radius * std::cos(scene.time * 0.5f), radius * std::sin(scene.time * 0.5f)};
+            scene.trampleRadius = 1.5f;
+        } else if (app.render.trample == Trample::FollowCamera) {
+            scene.trampleCenter = {camera.position.x, camera.position.z};
+            scene.trampleRadius = 1.5f;
+        }
 
         // CPU-side preparation (animation, batch builds, uploads) before any draw pass.
         grassRenderer.prepare(grass, scene, app.render, cpu, gpu);
+
+        // Stand-in for the rest of a game's frame. It runs after the simulation readback, where
+        // gameplay would consume the result, and before the draws are submitted. Only the time
+        // matters here: a spin loop does not compete for caches like real code would.
+        if (app.gameLogicMs > 0.0f) {
+            CpuScope scope(cpu, "Game logic (simulated)");
+            const Clock::time_point until =
+                Clock::now() + std::chrono::duration_cast<Clock::duration>(
+                                   std::chrono::duration<double, std::milli>(app.gameLogicMs));
+            while (Clock::now() < until) {
+            }
+        }
 
         glBindFramebuffer(GL_FRAMEBUFFER, sceneTarget.framebuffer());
         glViewport(0, 0, internalWidth, internalHeight);

@@ -65,7 +65,8 @@ function(add_lab_executable name)
         src/profiler.cpp
         src/render_target.cpp
         src/grass_renderer.cpp
-        src/stream_buffer.cpp)
+        src/stream_buffer.cpp
+        src/grass_sim.cpp)
     target_include_directories(${name} PRIVATE src)
     target_link_libraries(${name} PRIVATE glfw glm::glm libglew_static imgui OpenGL::GL)
     target_compile_definitions(${name} PRIVATE
