@@ -1,4 +1,6 @@
 #pragma once
+#include "culling.h"
+#include "gpu_culler.h"
 #include "grass.h"
 #include "grass_sim.h"
 #include "stream_buffer.h"
@@ -38,6 +40,16 @@ enum class UploadScope {
 
 enum class Trample { Off, Circle, FollowCamera, kCount };
 
+// Who decides which blades to draw (instanced SSBO path only).
+enum class CullMode {
+    None,              // draw every blade
+    CpuBlades,         // C1: CPU tests every blade, uploads the visible id list
+    CpuBladesParallel, // C1: same on all cores (two-pass compaction)
+    CpuChunks,         // C1: CPU tests 8 m chunks, emits one indirect command per visible chunk
+    Gpu,               // C2/C3: compute shader culls (+ LOD), writes its own indirect commands
+    kCount
+};
+
 inline constexpr const char* kRenderPathNames[] = {"Per-blade draws", "Static batch", "Dynamic batch",
                                                    "Instanced (attributes)", "Instanced (SSBO)"};
 inline constexpr const char* kRenderPathKeys[] = {"per-blade", "static-batch", "dynamic-batch",
@@ -52,6 +64,9 @@ inline constexpr const char* kUploadScopeNames[] = {"Changed data only (bends)",
 inline constexpr const char* kUploadScopeKeys[] = {"changed", "full"};
 inline constexpr const char* kTrampleNames[] = {"Off", "Scripted circle", "Follow camera"};
 inline constexpr const char* kTrampleKeys[] = {"off", "circle", "camera"};
+inline constexpr const char* kCullNames[] = {"None", "CPU per blade, 1 thread", "CPU per blade, all cores",
+                                             "CPU chunks + multi-draw indirect", "GPU compute + indirect"};
+inline constexpr const char* kCullKeys[] = {"none", "cpu", "cpu-mt", "cpu-chunks", "gpu"};
 
 struct GrassRenderSettings {
     RenderPath path = RenderPath::InstancedSsbo;
@@ -63,6 +78,10 @@ struct GrassRenderSettings {
     Readback readback = Readback::None;
     float stiffness = 40.0f;
     float damping = 4.0f;
+    CullMode cull = CullMode::None;
+    GpuCullSettings gpuCull;     // compaction, LOD, readback anti-pattern
+    float maxDistance = 0.0f;    // 0 = no distance culling
+    bool freezeCulling = false;  // keep culling with the camera of the moment it was frozen
     bool redundantState = false; // per-blade draws: rebind program/VAO and all uniforms every draw
     int cpuPathCap = 1'000'000;  // max blades for per-blade draws and batches
 
@@ -75,6 +94,17 @@ Animation effectiveAnimation(const GrassRenderSettings& settings);
 bool usesStreaming(const GrassRenderSettings& settings);
 bool isInstanced(RenderPath path);
 bool isSpring(Animation animation);
+// Culling needs the visible-id indirection, which only the SSBO path has.
+CullMode effectiveCull(const GrassRenderSettings& settings);
+
+// What the last frame's culling decided. GPU numbers arrive asynchronously (ageFrames late).
+struct CullStats {
+    uint32_t visible[GrassField::kLodCount] = {};
+    uint32_t visibleTotal = 0;
+    int ageFrames = -1;     // -1: unknown
+    uint32_t chunksDrawn = 0;
+    int chunkCount = 0;
+};
 
 class GrassRenderer {
 public:
@@ -92,12 +122,22 @@ public:
     int drawnBlades() const { return drawn_; }
     const char* error() const { return error_; }
     const GrassSim& sim() const { return sim_; }
+    const CullStats& cullStats() const { return cullStats_; }
+    // The camera culling used this frame (differs from the render camera while frozen).
+    const CullView& cullView() const { return cullView_; }
+    // Sets the culling camera directly; it stays while settings.freezeCulling is on.
+    void setCullView(const glm::mat4& viewProj, const glm::vec3& cameraPos) {
+        cullView_.viewProj = viewProj;
+        cullView_.cameraPos = cameraPos;
+        hasCullView_ = true;
+    }
+    double cullReadbackStallMs() const { return gpuCuller_.readbackStallMs(); }
 
 private:
     struct Program {
         GLuint id = 0;
         GLint viewProj = -1, time = -1, windDir = -1, windStrength = -1, proceduralWind = -1;
-        GLint sunDir = -1, cameraPos = -1, fogColor = -1, fogDensity = -1;
+        GLint sunDir = -1, cameraPos = -1, fogColor = -1, fogDensity = -1, colorByDraw = -1;
         GLint instanceA = -1, instanceB = -1;
 
         bool load(const char* vertexShader, const std::string& defines);
@@ -122,6 +162,9 @@ private:
     void releaseUnused(const GrassRenderSettings& settings);
     void prepareInstanced(const GrassField& field, const SceneParams& scene, const GrassRenderSettings& settings,
                           CpuProfiler& cpu, GpuProfiler& gpu);
+    void prepareCulling(const GrassField& field, const SceneParams& scene, const GrassRenderSettings& settings,
+                        CpuProfiler& cpu, GpuProfiler& gpu);
+    void drawCulled(const GrassField& field, const GrassRenderSettings& settings);
     static void writeBladeVertices(const GrassField& field, const GrassInstance& blade, glm::vec2 bend,
                                    bool proceduralWind, BatchedVertex* out);
 
@@ -133,6 +176,17 @@ private:
     StreamBuffer staticStream_, bendStream_, vertexStream_;
     std::vector<GrassInstance> animated_; // CPU-animated blades for per-blade draws
     GrassSim sim_;
+
+    // Culling
+    StreamBuffer visibleStream_, commandStream_; // CPU-written id lists / indirect commands
+    ChunkGrid chunks_;
+    GpuCuller gpuCuller_;
+    CullView cullView_;
+    bool hasCullView_ = false;
+    CullStats cullStats_;
+    GLuint frameVisibleBuffer_ = 0;
+    GLintptr frameVisibleOffset_ = 0, frameCommandOffset_ = 0;
+    uint32_t frameVisibleCount_ = 0, frameCommandCount_ = 0;
 
     GLuint batchIndexBuffer_ = 0, staticBatchBuffer_ = 0;
     uint64_t batchIndexBytes_ = 0, staticBatchBytes_ = 0;

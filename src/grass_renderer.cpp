@@ -47,6 +47,10 @@ Animation effectiveAnimation(const GrassRenderSettings& settings) {
     }
 }
 
+CullMode effectiveCull(const GrassRenderSettings& settings) {
+    return settings.path == RenderPath::InstancedSsbo ? settings.cull : CullMode::None;
+}
+
 bool usesStreaming(const GrassRenderSettings& settings) {
     if (settings.path == RenderPath::DynamicBatch) return true;
     const Animation animation = effectiveAnimation(settings);
@@ -68,6 +72,7 @@ bool GrassRenderer::Program::load(const char* vertexShader, const std::string& d
     cameraPos = glGetUniformLocation(id, "uCameraPos");
     fogColor = glGetUniformLocation(id, "uFogColor");
     fogDensity = glGetUniformLocation(id, "uFogDensity");
+    colorByDraw = glGetUniformLocation(id, "uColorByDraw");
     instanceA = glGetUniformLocation(id, "uInstanceA");
     instanceB = glGetUniformLocation(id, "uInstanceB");
     return true;
@@ -83,7 +88,8 @@ void GrassRenderer::Program::setScene(const SceneParams& scene, bool procedural)
     glProgramUniform3fv(id, cameraPos, 1, &scene.cameraPos[0]);
     glProgramUniform3fv(id, fogColor, 1, &scene.fogColor[0]);
     glProgramUniform1f(id, fogDensity, scene.fogDensity);
-    g_counters.uniformUpdates += 9;
+    glProgramUniform1i(id, colorByDraw, scene.colorByDraw ? 1 : 0);
+    g_counters.uniformUpdates += 10;
 }
 
 const GrassRenderer::Program& GrassRenderer::grassProgram(const std::string& defines) {
@@ -102,7 +108,7 @@ bool GrassRenderer::init() {
     // Compile the variants used at startup now, so shader errors surface immediately.
     if (!grassProgram("#define INSTANCE_FROM_UNIFORMS\n").id ||
         !grassProgram("#define INSTANCE_FROM_SSBO\n").id ||
-        !batchedProgram_.load("grass_batched.vert", "") || !sim_.init()) {
+        !batchedProgram_.load("grass_batched.vert", "") || !sim_.init() || !gpuCuller_.init()) {
         return false;
     }
 
@@ -169,6 +175,10 @@ void GrassRenderer::destroy() {
     staticStream_.release();
     bendStream_.release();
     vertexStream_.release();
+    visibleStream_.release();
+    commandStream_.release();
+    chunks_.release();
+    gpuCuller_.destroy();
     sim_.destroy();
     glDeleteBuffers(1, &batchIndexBuffer_);
     glDeleteBuffers(1, &staticBatchBuffer_);
@@ -197,6 +207,14 @@ void GrassRenderer::releaseUnused(const GrassRenderSettings& settings) {
     if (!instancedStreaming || settings.uploadScope != UploadScope::Full) staticStream_.release();
     if (settings.path != RenderPath::DynamicBatch) vertexStream_.release();
     if (!isInstanced(settings.path) || !isSpring(animation)) sim_.reset();
+    const CullMode cull = effectiveCull(settings);
+    if (cull != CullMode::CpuBlades && cull != CullMode::CpuBladesParallel) visibleStream_.release();
+    if (cull != CullMode::CpuChunks) {
+        commandStream_.release();
+        chunks_.release();
+    }
+    if (cull != CullMode::Gpu) gpuCuller_.release();
+    if (cull == CullMode::None) cullStats_ = {};
     if (settings.path != RenderPath::StaticBatch && staticBatchBuffer_) {
         glDeleteBuffers(1, &staticBatchBuffer_);
         staticBatchBuffer_ = 0;
@@ -328,12 +346,158 @@ void GrassRenderer::prepare(const GrassField& field, const SceneParams& scene,
     case RenderPath::InstancedAttributes:
     case RenderPath::InstancedSsbo:
         prepareInstanced(field, scene, settings, cpu, gpu);
+        if (drawn_ > 0 && effectiveCull(settings) != CullMode::None) prepareCulling(field, scene, settings, cpu, gpu);
         break;
 
     default:
         break;
     }
 }
+
+void GrassRenderer::prepareCulling(const GrassField& field, const SceneParams& scene,
+                                   const GrassRenderSettings& settings, CpuProfiler& cpu, GpuProfiler& gpu) {
+    // While frozen, culling keeps using the camera of the moment it was frozen, so you can fly
+    // out and look at what the culling kept.
+    if (!settings.freezeCulling || !hasCullView_) {
+        cullView_.viewProj = scene.viewProj;
+        cullView_.cameraPos = scene.cameraPos;
+        hasCullView_ = true;
+    }
+    cullView_.maxDistance = settings.maxDistance;
+    const Frustum frustum = Frustum::fromViewProj(cullView_.viewProj);
+    const uint32_t count = uint32_t(field.count());
+    cullStats_ = {};
+
+    switch (effectiveCull(settings)) {
+    case CullMode::CpuBlades:
+    case CullMode::CpuBladesParallel: {
+        if (!visibleStream_.reserve(uint64_t(count) * sizeof(uint32_t), settings.upload)) {
+            error_ = "Out of memory for the visible id list";
+            drawn_ = 0;
+            return;
+        }
+        auto* ids = static_cast<uint32_t*>(visibleStream_.beginWrite());
+        {
+            CpuScope scope(cpu, "Cull (CPU)");
+            frameVisibleCount_ = cullBladesCpu(field, frustum, cullView_,
+                                               effectiveCull(settings) == CullMode::CpuBladesParallel, ids);
+        }
+        CpuScope scope(cpu, "Upload");
+        frameVisibleOffset_ = visibleStream_.endWrite(uint64_t(frameVisibleCount_) * sizeof(uint32_t));
+        frameVisibleBuffer_ = visibleStream_.buffer();
+        cullStats_.visible[0] = cullStats_.visibleTotal = frameVisibleCount_;
+        cullStats_.ageFrames = 0;
+        break;
+    }
+
+    case CullMode::CpuChunks: {
+        chunks_.update(field);
+        const uint64_t bytes = uint64_t(std::max(chunks_.chunkCount(), 1)) * sizeof(DrawElementsIndirectCommand);
+        if (!commandStream_.reserve(bytes, settings.upload)) {
+            error_ = "Out of memory for the indirect commands";
+            drawn_ = 0;
+            return;
+        }
+        auto* commands = static_cast<DrawElementsIndirectCommand*>(commandStream_.beginWrite());
+        {
+            CpuScope scope(cpu, "Cull chunks (CPU)");
+            frameCommandCount_ = chunks_.cull(frustum, cullView_, field.lodMesh(0), commands, frameVisibleCount_);
+        }
+        frameCommandOffset_ = commandStream_.endWrite(uint64_t(frameCommandCount_) * sizeof(DrawElementsIndirectCommand));
+        frameVisibleBuffer_ = chunks_.sortedIdBuffer();
+        frameVisibleOffset_ = 0;
+        cullStats_.visible[0] = cullStats_.visibleTotal = frameVisibleCount_;
+        cullStats_.ageFrames = 0;
+        cullStats_.chunksDrawn = frameCommandCount_;
+        cullStats_.chunkCount = chunks_.chunkCount();
+        break;
+    }
+
+    case CullMode::Gpu: {
+        gpuCuller_.run(field, cullView_, settings.gpuCull, cpu, gpu);
+        frameVisibleBuffer_ = gpuCuller_.visibleBuffer();
+        frameVisibleOffset_ = 0;
+        const bool exact = settings.gpuCull.readbackCount;
+        for (int lod = 0; lod < GrassField::kLodCount; ++lod) {
+            cullStats_.visible[lod] = exact ? gpuCuller_.readbackCommands()[lod].instanceCount
+                                            : gpuCuller_.visibleBlades(lod);
+            cullStats_.visibleTotal += cullStats_.visible[lod];
+        }
+        cullStats_.ageFrames = exact ? 0 : gpuCuller_.statsAgeFrames();
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
+// ===== MUST READ (M4 #8): the three culled draw shapes ======================================
+// Compare how each mode turns "which blades are visible" into GL calls. None of them issues
+// more than one draw call; what differs is who wrote the instance count and the id list.
+void GrassRenderer::drawCulled(const GrassField& field, const GrassRenderSettings& settings) {
+    const GrassField::LodMesh& lod0 = field.lodMesh(0);
+    switch (effectiveCull(settings)) {
+    case CullMode::CpuBlades:
+    case CullMode::CpuBladesParallel:
+        // Count known on the CPU: an ordinary instanced draw over the uploaded id list.
+        if (frameVisibleCount_ == 0) return;
+        glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 2, frameVisibleBuffer_, frameVisibleOffset_,
+                          GLsizeiptr(uint64_t(frameVisibleCount_) * sizeof(uint32_t)));
+        glDrawElementsInstancedBaseInstance(GL_TRIANGLES, GLsizei(lod0.indexCount), GL_UNSIGNED_SHORT, nullptr,
+                                            GLsizei(frameVisibleCount_), 0);
+        g_counters.drawCalls += 1;
+        visibleStream_.endFrame();
+        break;
+
+    case CullMode::CpuChunks:
+        // Many draws, one call: the GPU walks the CPU-written command array.
+        if (frameCommandCount_ > 0) {
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, frameVisibleBuffer_);
+            glBindBuffer(GL_DRAW_INDIRECT_BUFFER, commandStream_.buffer());
+            glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT,
+                                        reinterpret_cast<const void*>(frameCommandOffset_), GLsizei(frameCommandCount_), 0);
+            g_counters.drawCalls += 1;
+            g_counters.indirectCommands += frameCommandCount_;
+        }
+        commandStream_.endFrame();
+        break;
+
+    case CullMode::Gpu: {
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, frameVisibleBuffer_);
+        const bool lod = settings.gpuCull.lod;
+        if (settings.gpuCull.readbackCount) {
+            // Anti-pattern path: the counts came back to the CPU, so draw directly.
+            for (int l = 0; l < (lod ? GrassField::kLodCount : 1); ++l) {
+                const DrawElementsIndirectCommand& c = gpuCuller_.readbackCommands()[l];
+                if (c.instanceCount == 0) continue;
+                glDrawElementsInstancedBaseVertexBaseInstance(
+                    GL_TRIANGLES, GLsizei(c.count), GL_UNSIGNED_SHORT,
+                    reinterpret_cast<const void*>(uintptr_t(c.firstIndex) * sizeof(uint16_t)), GLsizei(c.instanceCount),
+                    c.baseVertex, c.baseInstance);
+                g_counters.drawCalls += 1;
+            }
+            break;
+        }
+        // GPU-driven: the arguments never leave the GPU. With LOD, one call draws 3 commands
+        // (one per LOD mesh); gl_DrawID tells the vertex shader which one it is in.
+        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, gpuCuller_.commandBuffer());
+        if (lod) {
+            glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT, nullptr, GrassField::kLodCount, 0);
+            g_counters.indirectCommands += GrassField::kLodCount;
+        } else {
+            glDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT, nullptr);
+            g_counters.indirectCommands += 1;
+        }
+        g_counters.drawCalls += 1;
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+// ==========================================================================================
 
 void GrassRenderer::prepareInstanced(const GrassField& field, const SceneParams& scene,
                                      const GrassRenderSettings& settings, CpuProfiler& cpu, GpuProfiler& gpu) {
@@ -456,6 +620,8 @@ void GrassRenderer::submit(const GrassField& field, const SceneParams& scene,
         std::string defines = ssbo ? "#define INSTANCE_FROM_SSBO\n" : "#define INSTANCE_FROM_ATTRIBUTES\n";
         if (ssbo && layout == InstanceLayout::Packed16) defines += "#define PACKED_LAYOUT\n";
         if (frameDynamicBend_) defines += "#define DYNAMIC_BEND\n";
+        const CullMode cull = effectiveCull(settings);
+        if (cull != CullMode::None) defines += "#define VISIBLE_LIST\n";
         const Program& p = grassProgram(defines);
 
         if (ssbo) {
@@ -484,12 +650,24 @@ void GrassRenderer::submit(const GrassField& field, const SceneParams& scene,
         }
         glUseProgram(p.id);
         p.setScene(scene, animation == Animation::VertexShader);
-        glDrawElementsInstanced(GL_TRIANGLES, bladeIndexCount, GL_UNSIGNED_SHORT, nullptr, drawn_);
+        if (cull == CullMode::None) {
+            glDrawElementsInstanced(GL_TRIANGLES, bladeIndexCount, GL_UNSIGNED_SHORT, nullptr, drawn_);
+            g_counters.drawCalls += 1;
+        } else {
+            drawCulled(field, settings);
+        }
         g_counters.stateChanges += frameDynamicBend_ ? 4 : 3;
-        g_counters.drawCalls += 1;
         if (usesStreaming(settings)) {
             bendStream_.endFrame();
             if (settings.uploadScope == UploadScope::Full) staticStream_.endFrame();
+        }
+        if (cull != CullMode::None) {
+            // GPU culling's counts are only known through the async stats (a few frames late).
+            for (int lod = 0; lod < GrassField::kLodCount; ++lod) {
+                g_counters.instances += cullStats_.visible[lod];
+                g_counters.triangles += uint64_t(cullStats_.visible[lod]) * field.lodMesh(lod).triangles;
+            }
+            return;
         }
         break;
     }

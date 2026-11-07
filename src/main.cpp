@@ -7,6 +7,7 @@
 
 #include "camera.h"
 #include "counters.h"
+#include "debug_lines.h"
 #include "gl_util.h"
 #include "grass.h"
 #include "grass_renderer.h"
@@ -50,6 +51,11 @@ constexpr const char* kBudgetLabels[] = {"None", "30 fps (33.3 ms)", "60 fps (16
 constexpr float kBudgetMs[] = {0.0f, 1000.0f / 30.0f, 1000.0f / 60.0f, 1000.0f / 120.0f,
                                1000.0f / 144.0f};
 
+// Benchmark viewpoints. Ground: inside the field (culling removes most blades). Overview: high
+// above, the whole field in view (culling costs time but removes almost nothing).
+enum class CameraPreset { Ground, Overview, kCount };
+constexpr const char* kCameraPresetKeys[] = {"ground", "overview"};
+
 struct AppState {
     int instanceCount = 100000;
     float density = 40.0f; // blades per m^2
@@ -68,6 +74,10 @@ struct AppState {
     bool resetStats = false;
     int warmupFrames = 0; // frames left to skip after a reset
     float gameLogicMs = 0.0f; // simulated per-frame CPU work (gameplay, AI, physics...)
+    bool colorByDraw = false; // debug view
+    CameraPreset cameraPreset = CameraPreset::Ground;
+    bool hasCullCamera = false;
+    float cullCamera[5] = {}; // x, y, z, yaw, pitch
     bool hasCameraStart = false;
     float cameraStart[5] = {}; // x, y, z, yaw, pitch
 
@@ -121,6 +131,24 @@ void parseArgs(int argc, char** argv, AppState& app) {
         else if (key == "--damping") app.render.damping = float(std::atof(value));
         else if (key == "--redundant") app.render.redundantState = std::atoi(value) != 0;
         else if (key == "--game-logic-ms") app.gameLogicMs = std::clamp(float(std::atof(value)), 0.0f, 100.0f);
+        else if (key == "--cull") parseEnum(value, kCullKeys, app.render.cull);
+        else if (key == "--compaction") parseEnum(value, kCompactionKeys, app.render.gpuCull.compaction);
+        else if (key == "--lod") app.render.gpuCull.lod = std::atoi(value) != 0;
+        else if (key == "--lod-distances") {
+            std::sscanf(value, "%f,%f", &app.render.gpuCull.lodDistances.x, &app.render.gpuCull.lodDistances.y);
+        }
+        else if (key == "--cull-readback") app.render.gpuCull.readbackCount = std::atoi(value) != 0;
+        else if (key == "--max-distance") app.render.maxDistance = float(std::atof(value));
+        else if (key == "--camera-preset") parseEnum(value, kCameraPresetKeys, app.cameraPreset);
+        else if (key == "--cull-camera") {
+            // x,y,z,yaw,pitch: freeze culling at this camera (to inspect it from elsewhere)
+            if (std::sscanf(value, "%f,%f,%f,%f,%f", &app.cullCamera[0], &app.cullCamera[1], &app.cullCamera[2],
+                            &app.cullCamera[3], &app.cullCamera[4]) == 5) {
+                app.hasCullCamera = true;
+                app.render.freezeCulling = true;
+            }
+        }
+        else if (key == "--color-by-draw") app.colorByDraw = std::atoi(value) != 0;
         else if (key == "--camera") {
             // x,y,z,yaw,pitch (radians)
             if (std::sscanf(value, "%f,%f,%f,%f,%f", &app.cameraStart[0], &app.cameraStart[1], &app.cameraStart[2],
@@ -184,7 +212,8 @@ void appendCsvRow(const AppState& app, const GrassField& grass, const GrassRende
     static const char* kHeader =
         "gpu,path,animation,upload,upload_scope,layout,trample,readback,redundant,instances,drawn,segments,"
         "scale,frames,frame_avg,frame_p50,frame_p95,frame_p99,cpu_avg,gpu_avg,wait_avg,sim_cpu_ms,sim_gpu_ms,"
-        "readback_ms,draw_calls,triangles,upload_mb,verdict,game_logic_ms";
+        "readback_ms,draw_calls,triangles,upload_mb,verdict,game_logic_ms,cull,lod,compaction,cull_readback,"
+        "max_distance,camera,visible,cull_cpu_ms,cull_gpu_ms";
     const std::filesystem::path path(app.csvPath);
     if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
     const bool exists = std::filesystem::exists(path);
@@ -218,7 +247,16 @@ void appendCsvRow(const AppState& app, const GrassField& grass, const GrassRende
         << ',' << averageMs(gpuProfiler.results(), "Simulate") << ',' << renderer.sim().readbackStallMs() << ','
         << report.counters.drawCalls << ',' << report.counters.triangles << ','
         << double(report.counters.bytesUploaded) / (1024.0 * 1024.0) << ','
-        << verdictFor(false, frame.avg, cpu.avg, wait.avg) << ',' << app.gameLogicMs << '\n';
+        << verdictFor(false, frame.avg, cpu.avg, wait.avg) << ',' << app.gameLogicMs << ',';
+    const CullMode cull = effectiveCull(r);
+    const bool gpuCull = cull == CullMode::Gpu;
+    const uint32_t visible = cull == CullMode::None ? uint32_t(renderer.drawnBlades()) : renderer.cullStats().visibleTotal;
+    out << kCullKeys[int(cull)] << ',' << int(gpuCull && r.gpuCull.lod) << ','
+        << (gpuCull ? kCompactionKeys[int(r.gpuCull.compaction)] : "none") << ','
+        << int(gpuCull && r.gpuCull.readbackCount) << ',' << r.maxDistance << ','
+        << kCameraPresetKeys[int(app.cameraPreset)] << ',' << visible << ','
+        << averageMs(cpuProfiler.results(), "Cull (CPU)") + averageMs(cpuProfiler.results(), "Cull chunks (CPU)")
+        << ',' << averageMs(gpuProfiler.results(), "Cull") << '\n';
     std::printf("bench: %s %d blades: frame %.2f ms (cpu %.2f, gpu %.2f, wait %.2f)\n",
                 kRenderPathKeys[int(r.path)], grass.count(), frame.avg, cpu.avg, gpu.avg, wait.avg);
 }
@@ -308,6 +346,56 @@ void drawUi(AppState& app, FlyCamera& camera, const GrassField& grass, const Gra
                                withSeparators(uint64_t(grass.count())).c_str());
         }
         if (grassRenderer.error()) ImGui::TextColored({1.0f, 0.45f, 0.3f, 1.0f}, "%s", grassRenderer.error());
+    }
+
+    if (ImGui::CollapsingHeader("Culling & LOD", ImGuiTreeNodeFlags_DefaultOpen)) {
+        GrassRenderSettings& r = app.render;
+        if (r.path != RenderPath::InstancedSsbo) {
+            ImGui::TextDisabled("Culling needs the Instanced (SSBO) path:\nattributes cannot follow a visible-id list.");
+        } else {
+            int cull = int(r.cull);
+            if (ImGui::Combo("Culling", &cull, kCullNames, IM_ARRAYSIZE(kCullNames))) r.cull = CullMode(cull);
+            if (r.cull == CullMode::Gpu) {
+                int compaction = int(r.gpuCull.compaction);
+                if (ImGui::Combo("Compaction", &compaction, kCompactionNames, IM_ARRAYSIZE(kCompactionNames)))
+                    r.gpuCull.compaction = Compaction(compaction);
+                ImGui::Checkbox("LOD (3 meshes, one multi-draw)", &r.gpuCull.lod);
+                if (r.gpuCull.lod) {
+                    ImGui::SliderFloat2("LOD distances (m)", &r.gpuCull.lodDistances.x, 2.0f, 200.0f, "%.0f");
+                    r.gpuCull.lodDistances.y = std::max(r.gpuCull.lodDistances.y, r.gpuCull.lodDistances.x);
+                    ImGui::TextDisabled("LOD triangles: %d / %d / %d", grass.lodMesh(0).triangles,
+                                        grass.lodMesh(1).triangles, grass.lodMesh(2).triangles);
+                }
+                ImGui::Checkbox("Read visible count on CPU (sync, anti-pattern)", &r.gpuCull.readbackCount);
+                if (r.gpuCull.readbackCount) ImGui::Text("Readback stall: %.2f ms", grassRenderer.cullReadbackStallMs());
+            }
+            if (r.cull != CullMode::None) {
+                ImGui::SliderFloat("Max draw distance", &r.maxDistance, 0.0f, 300.0f,
+                                   r.maxDistance > 0.0f ? "%.0f m" : "off");
+                ImGui::Checkbox("Freeze culling camera", &r.freezeCulling);
+                ImGui::SameLine();
+                ImGui::Checkbox("Color by gl_DrawID", &app.colorByDraw);
+
+                const CullStats& s = grassRenderer.cullStats();
+                if (s.ageFrames >= 0) {
+                    const double share = grass.count() ? 100.0 * s.visibleTotal / grass.count() : 0.0;
+                    ImGui::Text("Visible blades: %s of %s (%.1f%%)", withSeparators(s.visibleTotal).c_str(),
+                                withSeparators(uint64_t(grass.count())).c_str(), share);
+                    if (r.cull == CullMode::Gpu && r.gpuCull.lod) {
+                        ImGui::Text("  per LOD: %s / %s / %s", withSeparators(s.visible[0]).c_str(),
+                                    withSeparators(s.visible[1]).c_str(), withSeparators(s.visible[2]).c_str());
+                    }
+                    if (r.cull == CullMode::CpuChunks) {
+                        ImGui::Text("Chunks drawn: %u of %d (one multi-draw)", s.chunksDrawn, s.chunkCount);
+                    }
+                    if (s.ageFrames > 0) {
+                        ImGui::TextDisabled("GPU counts read back asynchronously, %d frames old", s.ageFrames);
+                    }
+                } else {
+                    ImGui::TextDisabled("Visible blades: waiting for GPU stats");
+                }
+            }
+        }
     }
 
     if (ImGui::CollapsingHeader("Scene", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -453,6 +541,7 @@ void drawUi(AppState& app, FlyCamera& camera, const GrassField& grass, const Gra
     if (ImGui::CollapsingHeader("Counters", ImGuiTreeNodeFlags_DefaultOpen)) {
         const FrameCounters& c = report.counters;
         ImGui::Text("Draw calls        %s", withSeparators(c.drawCalls).c_str());
+        ImGui::Text("Indirect draws    %s", withSeparators(c.indirectCommands).c_str());
         ImGui::Text("State changes     %s", withSeparators(c.stateChanges).c_str());
         ImGui::Text("Uniform updates   %s", withSeparators(c.uniformUpdates).c_str());
         ImGui::Text("Instances         %s", withSeparators(c.instances).c_str());
@@ -508,7 +597,8 @@ int main(int argc, char** argv) {
     GrassField grass;
     GrassRenderer grassRenderer;
     Ground ground;
-    if (!grass.init() || !grassRenderer.init() || !ground.init()) return 1;
+    DebugLines debugLines;
+    if (!grass.init() || !grassRenderer.init() || !ground.init() || !debugLines.init()) return 1;
 
     GpuProfiler gpu;
     gpu.init();
@@ -607,6 +697,13 @@ int main(int argc, char** argv) {
             app.regenerate = false;
             app.resetStats = true;
             if (app.regenerateFailed && app.benchFrames > 0) break;
+            if (app.cameraPreset == CameraPreset::Overview) {
+                // High above the near edge, looking 45 degrees down: the whole field is in view.
+                const float size = grass.fieldSize();
+                camera.position = {0.0f, size, -size};
+                camera.yaw = 0.0f;
+                camera.pitch = -0.785f;
+            }
         }
         if (app.segments != grass.segments()) {
             grass.setSegments(app.segments);
@@ -647,6 +744,7 @@ int main(int argc, char** argv) {
         scene.sunDir = glm::normalize(glm::vec3(0.4f, 0.8f, 0.3f));
         scene.fogColor = defaults.fogColor;
         scene.fogDensity = app.fogDensity;
+        scene.colorByDraw = app.colorByDraw;
         if (app.render.trample == Trample::Circle) {
             const float radius = std::fmin(grass.fieldSize() * 0.3f, 12.0f);
             scene.trampleCenter = {radius * std::cos(scene.time * 0.5f), radius * std::sin(scene.time * 0.5f)};
@@ -654,6 +752,15 @@ int main(int argc, char** argv) {
         } else if (app.render.trample == Trample::FollowCamera) {
             scene.trampleCenter = {camera.position.x, camera.position.z};
             scene.trampleRadius = 1.5f;
+        }
+
+        if (app.hasCullCamera) {
+            FlyCamera cullCamera = camera;
+            cullCamera.position = {app.cullCamera[0], app.cullCamera[1], app.cullCamera[2]};
+            cullCamera.yaw = app.cullCamera[3];
+            cullCamera.pitch = app.cullCamera[4];
+            grassRenderer.setCullView(cullCamera.projection(aspect) * cullCamera.view(), cullCamera.position);
+            app.hasCullCamera = false;
         }
 
         // CPU-side preparation (animation, batch builds, uploads) before any draw pass.
@@ -684,6 +791,12 @@ int main(int argc, char** argv) {
         {
             GpuScope g(gpu, "Grass");
             grassRenderer.submit(grass, scene, app.render, cpu);
+        }
+        if (app.render.freezeCulling && effectiveCull(app.render) != CullMode::None) {
+            // Show the frozen culling camera; drawn over the grass so it stays visible.
+            glDisable(GL_DEPTH_TEST);
+            debugLines.drawFrustum(grassRenderer.cullView().viewProj, scene.viewProj, {1.0f, 0.85f, 0.1f});
+            glEnable(GL_DEPTH_TEST);
         }
         {
             GpuScope g(gpu, "Resolve to window");
@@ -716,6 +829,7 @@ int main(int argc, char** argv) {
     gpu.destroy();
     sceneTarget.destroy();
     grassRenderer.destroy();
+    debugLines.destroy();
     grass.destroy();
     ground.destroy();
     ImGui_ImplOpenGL3_Shutdown();

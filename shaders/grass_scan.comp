@@ -1,0 +1,38 @@
+#version 460 core
+// Pass 2 of 3 of prefix-sum compaction (see grass_cull.comp): turns per-workgroup visible
+// counts into per-workgroup output offsets, and writes the totals into the indirect commands.
+// One workgroup walks the list 1024 entries at a time, carrying the running total. 16M blades
+// are only ~62k workgroup totals, so a single workgroup is fast enough here; very large inputs
+// would scan the totals hierarchically instead.
+
+layout(local_size_x = 1024) in;
+
+struct Command { uint count; uint instanceCount; uint firstIndex; int baseVertex; uint baseInstance; };
+layout(std430, binding = 4) buffer Commands { Command commands[3]; };
+layout(std430, binding = 6) readonly buffer BlockSums { uvec4 blockSums[]; };
+layout(std430, binding = 7) writeonly buffer BlockOffsets { uvec4 blockOffsets[]; };
+
+uniform uint uBlockCount;
+
+shared uvec4 sScan[1024];
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    uvec4 carry = uvec4(0u);
+    for (uint base = 0u; base < uBlockCount; base += 1024u) {
+        uint index = base + t;
+        uvec4 value = index < uBlockCount ? blockSums[index] : uvec4(0u);
+        sScan[t] = value;
+        barrier();
+        for (uint offset = 1u; offset < 1024u; offset <<= 1u) {
+            uvec4 add = t >= offset ? sScan[t - offset] : uvec4(0u);
+            barrier();
+            sScan[t] += add;
+            barrier();
+        }
+        if (index < uBlockCount) blockOffsets[index] = carry + sScan[t] - value;
+        carry += sScan[1023];
+        barrier(); // everyone has read sScan[1023] before the next chunk overwrites it
+    }
+    if (t < 3u) commands[t].instanceCount = carry[t];
+}

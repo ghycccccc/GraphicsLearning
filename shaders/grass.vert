@@ -8,8 +8,29 @@
 //   PACKED_LAYOUT  SSBO data is the 16 B packed encoding (see InstanceLayout in grass.h)
 //   DYNAMIC_BEND   current bend comes from a per-frame buffer (CPU upload or compute sim)
 //                  instead of the static rest bend
+//   VISIBLE_LIST   (SSBO only) instances are entries of a culled id list, see below
 
 layout(location = 0) in vec2 aBlade; // x across the blade in [-0.5, 0.5], y = t in [0, 1]
+
+// ===== MUST READ (M4 #7): how a culled draw finds its blades ==============================
+// Without culling, instance i of the draw is blade i. With culling, a list of visible blade
+// ids sits in between: instance i of draw d is blade visibleIds[baseInstance(d) + i].
+//   CPU per-blade culling: one draw, list written by the CPU, baseInstance 0.
+//   CPU chunk culling:     one indirect command per visible chunk; baseInstance = where the
+//                          chunk's range starts in the chunk-sorted id list.
+//   GPU culling:           one indirect command per LOD; baseInstance = start of that LOD's
+//                          region, instanceCount written by the compute shader.
+// gl_InstanceID does NOT include baseInstance, hence the explicit gl_BaseInstance (GL 4.6).
+// Everything per blade (static data, bends) is then indexed by the blade id, so culling works
+// with every animation mode. Divisor attributes would apply baseInstance automatically but
+// cannot follow an id list, which is why culling is SSBO-only.
+#ifdef VISIBLE_LIST
+layout(std430, binding = 2) readonly buffer VisibleIds { uint visibleIds[]; };
+#  define BLADE_ID visibleIds[gl_BaseInstance + gl_InstanceID]
+#else
+#  define BLADE_ID uint(gl_InstanceID)
+#endif
+// ==========================================================================================
 
 #if defined(INSTANCE_FROM_UNIFORMS)
 uniform vec4 uInstanceA; // root.x, root.z, yaw (radians), color variation
@@ -44,6 +65,7 @@ out vec3 vWorldPos;
 out vec3 vNormal;
 out float vT;
 out float vVariation;
+flat out uint vDrawId; // which command of a multi-draw (LOD or chunk), for the debug view
 
 struct Blade {
     vec2 root;
@@ -70,6 +92,7 @@ Blade fetchBlade() {
     b.width = uInstanceB.y;
     b.bend = uInstanceB.zw;
 #else
+    uint id = BLADE_ID;
     float yaw01, restBend01;
     vec2 size;
 #  if defined(INSTANCE_FROM_ATTRIBUTES)
@@ -79,14 +102,14 @@ Blade fetchBlade() {
     restBend01 = aRestBend01;
     size = aSize;
 #  elif defined(PACKED_LAYOUT)
-    uvec4 s = statics[gl_InstanceID];
+    uvec4 s = statics[id];
     b.root = uintBitsToFloat(s.xy);
     yaw01 = float(s.z & 0xFFFFu) / 65535.0;
     b.variation = float((s.z >> 16) & 0xFFu) / 255.0;
     restBend01 = float(s.z >> 24) / 255.0;
     size = unpackHalf2x16(s.w);
 #  else
-    StaticBlade s = statics[gl_InstanceID];
+    StaticBlade s = statics[id];
     b.root = s.a.xy;
     yaw01 = s.a.z;
     b.variation = s.a.w;
@@ -101,9 +124,9 @@ Blade fetchBlade() {
 #  elif defined(INSTANCE_FROM_ATTRIBUTES)
     b.bend = aBend;
 #  elif defined(PACKED_LAYOUT)
-    b.bend = unpackHalf2x16(bends[gl_InstanceID]);
+    b.bend = unpackHalf2x16(bends[id]);
 #  else
-    b.bend = bends[gl_InstanceID];
+    b.bend = bends[id];
 #  endif
 #endif
     return b;
@@ -126,5 +149,6 @@ void main() {
     vWorldPos = p;
     vT = t;
     vVariation = blade.variation;
+    vDrawId = uint(gl_DrawID);
     gl_Position = uViewProj * vec4(p, 1.0);
 }

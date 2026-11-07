@@ -9,6 +9,7 @@ struct FrameCounters {
     uint64_t bytesUploaded = 0;
     uint64_t stateChanges = 0;   // program / VAO / buffer binding changes
     uint64_t uniformUpdates = 0; // glUniform* / glProgramUniform* calls
+    uint64_t indirectCommands = 0; // draws executed from indirect buffers (one call can run many)
 };
 
 inline FrameCounters g_counters;

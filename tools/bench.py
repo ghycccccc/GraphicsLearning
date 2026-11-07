@@ -67,9 +67,36 @@ M3_CONFIGS = [
     for mode in ("none", "sync", "async")
 ]
 
+M4_COUNTS = [100 * K, 300 * K, 1 * M, 3 * M, 10 * M, 16 * M]
+M4_SSBO = ["--path", "instanced-ssbo"]
+M4_CULLS = [("none", []), ("cpu", []), ("cpu-mt", []), ("cpu-chunks", []), ("gpu", ["--compaction", "workgroup"])]
+M4_CONFIGS = [
+    # A: culling modes from inside the field (most blades are off-screen)
+    (f"Cull {cull}, ground", M4_SSBO + ["--cull", cull, *extra], M4_COUNTS) for cull, extra in M4_CULLS
+] + [
+    # B: same modes with the whole field in view: culling cost without benefit
+    (f"Cull {cull}, overview", M4_SSBO + ["--cull", cull, "--camera-preset", "overview", *extra], [1 * M, 10 * M])
+    for cull, extra in M4_CULLS
+] + [
+    # C: LOD with a heavier blade (8 segments: 15 / 7 / 1 triangles)
+    (f"GPU cull, LOD {lod}", M4_SSBO + ["--cull", "gpu", "--segments", "8", "--lod", str(lod)], [3 * M, 10 * M, 16 * M])
+    for lod in (0, 1)
+] + [
+    # D: compaction strategies, where contention is moderate (ground) and maximal (overview)
+    (f"Compaction {comp}, {camera}", M4_SSBO + ["--cull", "gpu", "--compaction", comp, "--camera-preset", camera],
+     [1 * M, 10 * M, 16 * M])
+    for comp in ("global", "workgroup", "prefix") for camera in ("ground", "overview")
+] + [
+    # E: reading the visible count back on the CPU, with and without other CPU work
+    (f"Cull readback {rb}, logic {logic}", M4_SSBO + ["--cull", "gpu", "--cull-readback", str(rb),
+                                                      "--game-logic-ms", str(logic)], [10 * M])
+    for rb in (0, 1) for logic in (0, 10)
+]
+
 SUITES = {
     "m2": {"configs": M2_CONFIGS, "csv": ROOT / "bench" / "m2_results.csv", "png": ROOT / "bench" / "m2_submission.png"},
     "m3": {"configs": M3_CONFIGS, "csv": ROOT / "bench" / "m3_results.csv", "png": ROOT / "bench" / "m3_residency.png"},
+    "m4": {"configs": M4_CONFIGS, "csv": ROOT / "bench" / "m4_results.csv", "png": ROOT / "bench" / "m4_culling.png"},
 }
 
 
@@ -138,7 +165,8 @@ def line_panel(ax, series, title, ylabel="average frame time (ms)", field="frame
         ax.plot(xs, ys, style, marker="o", markersize=4, label=label + suffix)
     if budget:
         ax.axhline(BUDGET_MS, color="gray", linewidth=1, linestyle=":")
-        ax.text(1.05e4, BUDGET_MS * 1.08, "60 fps budget", color="gray", fontsize=8)
+        first = min(n for _, points, _ in series if points for n, _ in points)
+        ax.text(first * 1.05, BUDGET_MS * 1.08, "60 fps budget", color="gray", fontsize=8)
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel("blades (7 triangles each)")
@@ -261,12 +289,129 @@ def plot_m3(rows, out):
         print(f"  {name:15s} {budget_capacity(select(rows, animation=anim, **extra, **ssbo))}")
 
 
+def plot_m4(rows, out):
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    names = {"none": "No culling", "cpu": "CPU per blade, 1 thread", "cpu-mt": "CPU per blade, all cores",
+             "cpu-chunks": "CPU chunks + MDI", "gpu": "GPU compute + indirect"}
+    base = dict(path="instanced-ssbo", segments="4", lod="0", cull_readback="0", game_logic_ms="0")
+    fig, axes = plt.subplots(2, 3, figsize=(21, 11))
+
+    def by_cull(camera, **extra):
+        series = {}
+        for cull in names:
+            comp = {"compaction": "workgroup"} if cull == "gpu" else {}
+            series[cull] = select(rows, cull=cull, camera=camera, **base, **comp, **extra)
+        return series
+
+    # A: frame time from inside the field
+    ground = by_cull("ground")
+    line_panel(axes[0][0], [(names[c], pts, "--" if c == "none" else "-") for c, pts in ground.items()],
+               "A. Culling from inside the field (~25% visible)")
+
+    # B: what culling itself costs: CPU or GPU time of the cull step, ground vs overview
+    ax = axes[0][1]
+    modes = [c for c in names if c != "none"]
+    x = np.arange(len(modes))
+    overview = by_cull("overview")
+    for ci, (camera, series) in enumerate([("ground", ground), ("overview", overview)]):
+        costs, frames = [], []
+        for c in modes:
+            row = dict(series[c]).get(10 * M)
+            costs.append(float(row["cull_gpu_ms"] if c == "gpu" else row["cull_cpu_ms"]) if row else 0)
+            frames.append(float(row["frame_avg"]) if row else 0)
+        bars = ax.bar(x + (ci - 0.5) * 0.38, costs, 0.38, label=f"{camera} camera", hatch="" if ci == 0 else "//")
+        ax.bar_label(bars, labels=[f"{c:.2f}\n(frame {f:.1f})" for c, f in zip(costs, frames)], fontsize=7)
+    ax.set_xticks(x, [names[c].replace(", ", "\n").replace(" + ", "\n+ ") for c in modes], fontsize=8)
+    ax.set_yscale("log")
+    ax.set_ylabel("cull step time at 10M blades (ms, log)\nCPU modes: CPU time, GPU mode: GPU time")
+    ax.set_title("B. Cost of the culling step itself", fontsize=11)
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="y", alpha=0.25)
+
+    # C: blades actually drawn
+    ax = axes[0][2]
+    counts = [1 * M, 10 * M]
+    x = np.arange(len(modes) + 1)
+    for gi, (camera, series) in enumerate([("ground", ground), ("overview", overview)]):
+        vis = []
+        for c in ["none"] + modes:
+            row = dict(series[c]).get(10 * M)
+            vis.append(int(row["visible"]) / 1e6 if row else 0)
+        bars = ax.bar(x + (gi - 0.5) * 0.38, vis, 0.38, label=f"{camera} camera", hatch="" if gi == 0 else "//")
+        ax.bar_label(bars, fmt="%.2f", fontsize=7)
+    ax.set_xticks(x, [names[c].replace(", ", "\n").replace(" + ", "\n+ ") for c in ["none"] + modes], fontsize=8)
+    ax.set_ylabel("blades drawn (millions) of 10M")
+    ax.set_title("C. What survives culling (chunks are coarser)", fontsize=11)
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="y", alpha=0.25)
+
+    # D: LOD
+    ax = axes[1][0]
+    lod_counts = [3 * M, 10 * M, 16 * M]
+    x = np.arange(len(lod_counts))
+    for li, lod in enumerate(("0", "1")):
+        points = dict(select(rows, path="instanced-ssbo", cull="gpu", segments="8", lod=lod, camera="ground"))
+        gpu = [float(points[n]["gpu_avg"]) if n in points else 0 for n in lod_counts]
+        tris = [int(points[n]["triangles"]) / 1e6 if n in points else 0 for n in lod_counts]
+        bars = ax.bar(x + (li - 0.5) * 0.38, gpu, 0.38, label="LOD on (15 / 7 / 1 tris)" if lod == "1" else "LOD off (15 tris)")
+        ax.bar_label(bars, labels=[f"{g:.1f} ms\n{t:.1f}M tris" for g, t in zip(gpu, tris)], fontsize=7)
+    ax.set_xticks(x, [f"{n // M}M blades" for n in lod_counts])
+    ax.set_ylabel("GPU work per frame (ms)")
+    ax.set_title("D. LOD on top of GPU culling (8-segment blades)", fontsize=11)
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="y", alpha=0.25)
+
+    # E: compaction
+    ax = axes[1][1]
+    comps = [("global", "Global atomics"), ("workgroup", "Workgroup atomics"), ("prefix", "Prefix sum")]
+    groups = [(n, cam) for n in (1 * M, 10 * M, 16 * M) for cam in ("ground", "overview")]
+    x = np.arange(len(groups))
+    for ci, (comp, label) in enumerate(comps):
+        ys = []
+        for n, cam in groups:
+            row = dict(select(rows, path="instanced-ssbo", cull="gpu", compaction=comp, camera=cam, lod="0",
+                              cull_readback="0", game_logic_ms="0", segments="4")).get(n)
+            ys.append(float(row["cull_gpu_ms"]) if row else 0)
+        bars = ax.bar(x + (ci - 1) * 0.27, ys, 0.27, label=label)
+        ax.bar_label(bars, fmt="%.2f", fontsize=6)
+    ax.set_xticks(x, [f"{n // M}M\n{cam}" for n, cam in groups], fontsize=8)
+    ax.set_ylabel("GPU cull pass (ms)")
+    ax.set_title("E. Stream compaction strategies", fontsize=11)
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="y", alpha=0.25)
+
+    # F: readback anti-pattern
+    ax = axes[1][2]
+    labels, ys, colors = [], [], []
+    for logic in ("0", "10"):
+        for rb in ("0", "1"):
+            row = dict(select(rows, path="instanced-ssbo", cull="gpu", cull_readback=rb, game_logic_ms=logic,
+                              camera="ground", lod="0", compaction="workgroup", segments="4")).get(10 * M)
+            labels.append(f"{'sync readback' if rb == '1' else 'indirect'}\n+{logic} ms logic")
+            ys.append(float(row["frame_avg"]) if row else 0)
+            colors.append("C3" if rb == "1" else "C0")
+    bars = ax.bar(np.arange(4), ys, color=colors)
+    ax.bar_label(bars, fmt="%.1f", fontsize=8)
+    ax.set_xticks(np.arange(4), labels, fontsize=8)
+    ax.set_ylabel("average frame time (ms)")
+    ax.set_title("F. Indirect draw vs reading the count back (10M blades)", fontsize=11)
+    ax.grid(True, axis="y", alpha=0.25)
+
+    save(fig, out, "Milestone 4: culling, LOD and GPU-driven drawing", rows[0]["gpu"])
+    print("60 fps capacity (ground camera):")
+    for cull, pts in ground.items():
+        print(f"  {names[cull]:28s} {budget_capacity(pts)}")
+
+
 def plot(args):
     suite = SUITES[args.suite]
     rows = load_rows(args.csv or suite["csv"])
     if not rows:
         sys.exit("no usable rows in the CSV")
-    (plot_m2 if args.suite == "m2" else plot_m3)(rows, args.out or suite["png"])
+    plotters = {"m2": plot_m2, "m3": plot_m3, "m4": plot_m4}
+    plotters[args.suite](rows, args.out or suite["png"])
 
 
 def main():

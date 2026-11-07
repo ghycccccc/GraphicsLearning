@@ -1,0 +1,141 @@
+#version 460 core
+// ===== MUST READ (M4 #4): GPU culling, LOD selection and stream compaction ================
+// One invocation per blade: classify it (LOD 0/1/2 or culled), then append its id to the
+// visible-id list of its LOD and grow that LOD's indirect draw command. The CPU never sees
+// the result: the draw that follows reads instanceCount straight from the command buffer.
+//
+// The hard part is "append". Thousands of threads find visible blades at the same moment, and
+// each needs a unique output slot. Variants (exactly one is defined by the host):
+//   COMPACTION_GLOBAL     every visible blade does atomicAdd on the global counter. Simple, but
+//                         millions of atomics hit the same 3 addresses and serialize there.
+//   COMPACTION_WORKGROUP  threads first count in shared memory (cheap, on-chip), then ONE
+//                         thread per workgroup reserves a block of slots with a single global
+//                         atomic: up to 256x fewer contended operations.
+//   PREFIX_COUNT          pass 1 of 3 of prefix-sum compaction: per-workgroup scan, write totals.
+//   PREFIX_SCATTER        pass 3 of 3: recompute, add the workgroup's offset, write ids.
+//                         (Pass 2 is grass_scan.comp.) No contended atomics at all, and the
+//                         output keeps blade order, which atomics do not guarantee.
+// Modifier: PACKED_LAYOUT selects the 16 B static-data encoding.
+// =========================================================================================
+
+layout(local_size_x = 256) in;
+
+#ifdef PACKED_LAYOUT
+layout(std430, binding = 0) readonly buffer Statics { uvec4 statics[]; };
+#else
+struct StaticBlade { vec4 a; vec4 b; };
+layout(std430, binding = 0) readonly buffer Statics { StaticBlade statics[]; };
+#endif
+
+// Same layout as DrawElementsIndirectCommand in culling.h (5 x 4 bytes).
+struct Command { uint count; uint instanceCount; uint firstIndex; int baseVertex; uint baseInstance; };
+layout(std430, binding = 4) buffer Commands { Command commands[3]; };
+layout(std430, binding = 5) writeonly buffer VisibleIds { uint visibleIds[]; };
+#if defined(PREFIX_COUNT)
+layout(std430, binding = 6) writeonly buffer BlockSums { uvec4 blockSums[]; };
+#elif defined(PREFIX_SCATTER)
+layout(std430, binding = 7) readonly buffer BlockOffsets { uvec4 blockOffsets[]; };
+#endif
+
+uniform uint uCount;
+uniform uint uRegion;      // ids of LOD l are written from l * uRegion on (gl_BaseInstance of draw l)
+uniform vec4 uPlanes[6];   // inward unit normals, see Frustum::fromViewProj
+uniform vec3 uCameraPos;
+uniform float uMaxDistance; // 0 = off
+uniform bool uLodEnabled;
+uniform vec2 uLodDistances; // LOD 1 from x metres, LOD 2 from y metres
+
+const float kBendReach = 2.0; // must match kCullBendReach in culling.h
+const uint kCulled = 3u;
+
+// Returns the LOD (0..2) of blade i, or kCulled.
+uint classify(uint i) {
+    if (i >= uCount) return kCulled;
+#ifdef PACKED_LAYOUT
+    uvec4 s = statics[i];
+    vec2 root = uintBitsToFloat(s.xy);
+    float h = unpackHalf2x16(s.w).x;
+#else
+    vec2 root = statics[i].a.xy;
+    float h = statics[i].b.x;
+#endif
+    vec3 center = vec3(root.x, 0.5 * h, root.y);
+    float radius = h * (0.5 + kBendReach);
+    for (int p = 0; p < 6; ++p) {
+        if (dot(uPlanes[p].xyz, center) + uPlanes[p].w < -radius) return kCulled;
+    }
+    float dist = distance(uCameraPos, center);
+    if (uMaxDistance > 0.0 && dist - radius > uMaxDistance) return kCulled;
+    if (!uLodEnabled) return 0u;
+    return dist < uLodDistances.x ? 0u : (dist < uLodDistances.y ? 1u : 2u);
+}
+
+#if defined(COMPACTION_GLOBAL)
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint lod = classify(i);
+    if (lod == kCulled) return;
+    uint slot = atomicAdd(commands[lod].instanceCount, 1u);
+    visibleIds[lod * uRegion + slot] = i;
+}
+
+#elif defined(COMPACTION_WORKGROUP)
+
+shared uint sCount[3];
+shared uint sBase[3];
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    if (t < 3u) sCount[t] = 0u;
+    barrier();
+
+    // Every thread reaches every barrier(): out-of-range threads classify as culled
+    // instead of returning early.
+    uint i = gl_GlobalInvocationID.x;
+    uint lod = classify(i);
+    uint localSlot = 0u;
+    if (lod != kCulled) localSlot = atomicAdd(sCount[lod], 1u); // shared memory: on-chip
+    barrier();
+
+    if (t < 3u && sCount[t] > 0u) sBase[t] = atomicAdd(commands[t].instanceCount, sCount[t]);
+    barrier();
+
+    if (lod != kCulled) visibleIds[lod * uRegion + sBase[lod] + localSlot] = i;
+}
+
+#else // PREFIX_COUNT / PREFIX_SCATTER
+
+shared uvec4 sScan[256];
+
+// Inclusive Hillis-Steele scan across the workgroup. Each component counts one LOD, so one
+// scan handles all three lists at once.
+uvec4 inclusiveScan(uvec4 value) {
+    uint t = gl_LocalInvocationIndex;
+    sScan[t] = value;
+    barrier();
+    for (uint offset = 1u; offset < 256u; offset <<= 1u) {
+        uvec4 add = t >= offset ? sScan[t - offset] : uvec4(0u);
+        barrier();
+        sScan[t] += add;
+        barrier();
+    }
+    return sScan[t];
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint lod = classify(i);
+    uvec4 oneHot = uvec4(lod == 0u, lod == 1u, lod == 2u, 0u);
+    uvec4 inclusive = inclusiveScan(oneHot);
+#  if defined(PREFIX_COUNT)
+    if (gl_LocalInvocationIndex == 255u) blockSums[gl_WorkGroupID.x] = inclusive;
+#  else
+    if (lod != kCulled) {
+        uvec4 slot = blockOffsets[gl_WorkGroupID.x] + inclusive - oneHot; // exclusive position
+        visibleIds[lod * uRegion + slot[lod]] = i;
+    }
+#  endif
+}
+
+#endif

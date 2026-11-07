@@ -139,7 +139,10 @@ RenderDoc (frame/buffer/indirect-args inspection), Nsight Graphics (frame debugg
 3. **Residency**: B2 compute + GPU-persistent data, B3 is the current VS wind; A4 packed layout.
    Detailed plan: [m3-residency.md](m3-residency.md) (stateful spring sim, CPU 1T/MT vs compute,
    static/dynamic data split, 16 B layout, trample interactor, readback stall demo).
-4. **Culling**: C1 → C2 (indirect) → C3 (LOD + MDI); frozen-camera and LOD debug views.
+4. **Culling** (done): C1 (CPU per blade 1 thread / all cores, CPU chunks + MDI) → C2 (GPU compute + indirect,
+   global / workgroup / prefix-sum compaction) → C3 (3 LODs, one multi-draw); frozen culling camera, color by
+   gl_DrawID, readback anti-pattern. Details, reading guide and results: [m4-culling.md](m4-culling.md).
+   Shadow-map stress pass deferred (M4.5 or with M5).
 5. **Pixel cost**: D1–D4, pipeline statistics, overdraw heatmap.
 6. **Benchmark mode**: camera path, sweeps, CSV, Python plots.
 7. **Occlusion & advanced**: C4 Hi-Z, E1, E2 mesh shaders, E3 particles.

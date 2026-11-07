@@ -14,6 +14,7 @@ out vec3 vWorldPos;
 out vec3 vNormal;
 out float vT;
 out float vVariation;
+flat out uint vDrawId;
 
 void main() {
     // Static batches keep procedural wind (weight = h * t^2); dynamic batches bake it on the
@@ -27,5 +28,6 @@ void main() {
     vWorldPos = p;
     vT = aPosT.w;
     vVariation = aExtra.x;
+    vDrawId = 0u;
     gl_Position = uViewProj * vec4(p, 1.0);
 }

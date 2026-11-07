@@ -57,37 +57,58 @@ void GrassField::destroy() {
     glDeleteBuffers(1, &staticBuffer_);
 }
 
+namespace {
+// Blade in a local (x across, t up) space: pairs of vertices per level, one tip vertex.
+void buildBlade(int segments, std::vector<glm::vec2>& vertices, std::vector<uint16_t>& indices) {
+    vertices.clear();
+    for (int i = 0; i < segments; ++i) {
+        const float t = float(i) / float(segments);
+        vertices.push_back({-0.5f, t});
+        vertices.push_back({0.5f, t});
+    }
+    vertices.push_back({0.0f, 1.0f});
+
+    indices.clear();
+    for (int i = 0; i < segments - 1; ++i) {
+        const uint16_t v = uint16_t(i * 2);
+        indices.insert(indices.end(), {v, uint16_t(v + 1), uint16_t(v + 2)});
+        indices.insert(indices.end(), {uint16_t(v + 1), uint16_t(v + 3), uint16_t(v + 2)});
+    }
+    const uint16_t top = uint16_t((segments - 1) * 2);
+    indices.insert(indices.end(), {top, uint16_t(top + 1), uint16_t(top + 2)});
+}
+} // namespace
+
 void GrassField::setSegments(int segments) {
     segments_ = segments < 1 ? 1 : (segments > kMaxSegments ? kMaxSegments : segments);
+    buildBlade(segments_, bladeVertices_, bladeIndices_);
 
-    // Blade in a local (x across, t up) space: pairs of vertices per level, one tip vertex.
-    bladeVertices_.clear();
-    for (int i = 0; i < segments_; ++i) {
-        const float t = float(i) / float(segments_);
-        bladeVertices_.push_back({-0.5f, t});
-        bladeVertices_.push_back({0.5f, t});
+    // The GPU buffers hold all LOD meshes back to back: LOD 0 first (so draws that ignore LOD
+    // use offset 0), then half the segments, then a single triangle. A draw selects one with
+    // firstIndex + baseVertex; one multi-draw-indirect call can draw all three.
+    const int lodSegments[kLodCount] = {segments_, std::max(1, segments_ / 2), 1};
+    std::vector<glm::vec2> gpuVertices;
+    std::vector<uint16_t> gpuIndices;
+    for (int lod = 0; lod < kLodCount; ++lod) {
+        std::vector<glm::vec2> vertices;
+        std::vector<uint16_t> indices;
+        buildBlade(lodSegments[lod], vertices, indices);
+        lodMeshes_[lod] = {uint32_t(indices.size()), uint32_t(gpuIndices.size()), int32_t(gpuVertices.size()),
+                           uint32_t(indices.size() / 3)};
+        gpuVertices.insert(gpuVertices.end(), vertices.begin(), vertices.end());
+        gpuIndices.insert(gpuIndices.end(), indices.begin(), indices.end());
     }
-    bladeVertices_.push_back({0.0f, 1.0f});
 
-    bladeIndices_.clear();
-    for (int i = 0; i < segments_ - 1; ++i) {
-        const uint16_t v = uint16_t(i * 2);
-        bladeIndices_.insert(bladeIndices_.end(), {v, uint16_t(v + 1), uint16_t(v + 2)});
-        bladeIndices_.insert(bladeIndices_.end(), {uint16_t(v + 1), uint16_t(v + 3), uint16_t(v + 2)});
-    }
-    const uint16_t top = uint16_t((segments_ - 1) * 2);
-    bladeIndices_.insert(bladeIndices_.end(), {top, uint16_t(top + 1), uint16_t(top + 2)});
-
-    const auto vboBytes = GLsizeiptr(bladeVertices_.size() * sizeof(glm::vec2));
-    const auto iboBytes = GLsizeiptr(bladeIndices_.size() * sizeof(uint16_t));
+    const auto vboBytes = GLsizeiptr(gpuVertices.size() * sizeof(glm::vec2));
+    const auto iboBytes = GLsizeiptr(gpuIndices.size() * sizeof(uint16_t));
 
     glDeleteBuffers(1, &vbo_);
     glDeleteBuffers(1, &ibo_);
     g_residentBytes -= meshBytes_;
     glCreateBuffers(1, &vbo_);
-    glNamedBufferStorage(vbo_, vboBytes, bladeVertices_.data(), 0);
+    glNamedBufferStorage(vbo_, vboBytes, gpuVertices.data(), 0);
     glCreateBuffers(1, &ibo_);
-    glNamedBufferStorage(ibo_, iboBytes, bladeIndices_.data(), 0);
+    glNamedBufferStorage(ibo_, iboBytes, gpuIndices.data(), 0);
     meshBytes_ = uint64_t(vboBytes + iboBytes);
     g_residentBytes += meshBytes_;
     g_counters.bytesUploaded += meshBytes_;

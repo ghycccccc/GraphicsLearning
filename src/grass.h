@@ -18,6 +18,7 @@ struct SceneParams {
     float fogDensity = 0.01f;
     glm::vec2 trampleCenter{0.0f}; // xz of the trample sphere
     float trampleRadius = 0.0f;    // 0 = no trampling
+    bool colorByDraw = false;      // debug view: tint blades by gl_DrawID
 };
 
 // CPU-side per-blade record. The per-blade and batch paths read it directly; the instanced
@@ -51,6 +52,15 @@ float windSway(glm::vec2 rootXZ, float time, float strength);
 class GrassField {
 public:
     static constexpr int kMaxSegments = 16;
+    static constexpr int kLodCount = 3;
+
+    // One blade mesh inside the shared GPU vertex/index buffers.
+    struct LodMesh {
+        uint32_t indexCount;
+        uint32_t firstIndex;
+        int32_t baseVertex;
+        uint32_t triangles;
+    };
 
     bool init();
     void destroy();
@@ -77,6 +87,9 @@ public:
     int indicesPerBlade() const { return int(bladeIndices_.size()); }
     int trianglesPerBlade() const { return indicesPerBlade() / 3; }
 
+    // LOD 0 is the full blade (same as bladeVertices()/bladeIndices()), at offset 0 in the GPU buffers.
+    const LodMesh& lodMesh(int lod) const { return lodMeshes_[lod]; }
+
     GLuint bladeVertexBuffer() const { return vbo_; }
     GLuint bladeIndexBuffer() const { return ibo_; }
     GLuint staticBuffer() const { return staticBuffer_; }
@@ -93,6 +106,7 @@ private:
     std::vector<std::byte> staticBytes_;
     std::vector<glm::vec2> bladeVertices_;
     std::vector<uint16_t> bladeIndices_;
+    LodMesh lodMeshes_[kLodCount] = {};
     GLuint vbo_ = 0, ibo_ = 0;
     GLuint staticBuffer_ = 0;
     uint64_t staticBufferBytes_ = 0;
